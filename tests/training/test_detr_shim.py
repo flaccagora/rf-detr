@@ -378,6 +378,30 @@ class TestRFDETRTrainPTL:
         # get_train_config must have been called without device=
         assert "device" not in mock_self.get_train_config.call_args.kwargs
 
+    def test_check_val_every_n_epoch_forwarded_to_trainer(self, tmp_path, patch_lit):
+        """Validation frequency bypasses TrainConfig and reaches the PTL trainer."""
+        mock_self = _make_rfdetr_self(tmp_path)
+        p_mod, p_dm, p_bt, _mcls, _dmcls, mock_bt = patch_lit
+        with p_mod, p_dm, p_bt:
+            RFDETR.train(mock_self, check_val_every_n_epoch=10)
+
+        assert "check_val_every_n_epoch" not in mock_self.get_train_config.call_args.kwargs
+        config = mock_self.get_train_config.return_value
+        mock_bt.assert_called_once_with(
+            config,
+            mock_self.model_config,
+            accelerator=None,
+            check_val_every_n_epoch=10,
+        )
+
+    @pytest.mark.parametrize("value", [0, -1, True, 1.5, "10"])
+    def test_check_val_every_n_epoch_rejects_invalid_values(self, tmp_path, patch_lit, value):
+        """Validation frequency must be a positive integer."""
+        mock_self = _make_rfdetr_self(tmp_path)
+        p_mod, p_dm, p_bt, *_ = patch_lit
+        with p_mod, p_dm, p_bt, pytest.raises(ValueError, match="positive integer"):
+            RFDETR.train(mock_self, check_val_every_n_epoch=value)
+
     def test_skip_best_epochs_forwarded_to_get_train_config(self, tmp_path, patch_lit):
         """Non-absorbed training kwargs must reach get_train_config unchanged."""
         mock_self = _make_rfdetr_self(tmp_path)

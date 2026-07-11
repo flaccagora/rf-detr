@@ -690,6 +690,8 @@ class RFDETR:
           Lightning trainer arguments. ``"cpu"`` becomes ``accelerator="cpu"``; ``"cuda"`` and ``"cuda:N"`` become
           ``accelerator="gpu"`` and optionally ``devices=[N]``; ``"mps"`` becomes ``accelerator="mps"``. Other valid
           torch device types fall back to PTL auto-detection and emit a :class:`UserWarning`.
+        * ``check_val_every_n_epoch`` — forwarded directly to the PyTorch Lightning
+          trainer. It must be a positive integer and is not part of :class:`~rfdetr.config.TrainConfig`.
         * ``callbacks`` — if the dict contains any non-empty lists a
           :class:`DeprecationWarning` is emitted; the dict is then discarded. Use PTL
           :class:`~pytorch_lightning.Callback` objects passed via :func:`~rfdetr.training.build_trainer` instead.
@@ -750,6 +752,20 @@ class RFDETR:
         # Supports torch-style strings and torch.device (e.g. "cuda:1").
         _device = kwargs.pop("device", None)
         _accelerator, _devices = RFDETR._resolve_trainer_device_kwargs(_device)
+
+        # Validation loop frequency belongs to PTL's Trainer rather than TrainConfig.
+        # Pop it before strict TrainConfig validation, then forward it when the
+        # trainer is constructed below.
+        _check_val_every_n_epoch = kwargs.pop("check_val_every_n_epoch", None)
+        if _check_val_every_n_epoch is not None:
+            if isinstance(_check_val_every_n_epoch, bool):
+                raise ValueError("check_val_every_n_epoch must be a positive integer")
+            try:
+                _check_val_every_n_epoch = operator.index(_check_val_every_n_epoch)
+            except TypeError as error:
+                raise ValueError("check_val_every_n_epoch must be a positive integer") from error
+            if _check_val_every_n_epoch < 1:
+                raise ValueError("check_val_every_n_epoch must be a positive integer")
 
         # Absorb legacy `start_epoch` — PTL resumes automatically via ckpt_path.
         if "start_epoch" in kwargs:
@@ -872,6 +888,8 @@ class RFDETR:
         trainer_kwargs = {"accelerator": _accelerator}
         if _devices is not None:
             trainer_kwargs["devices"] = _devices
+        if _check_val_every_n_epoch is not None:
+            trainer_kwargs["check_val_every_n_epoch"] = _check_val_every_n_epoch
         trainer = build_trainer(config, self.model_config, **trainer_kwargs)
         trainer.fit(module, datamodule, ckpt_path=config.resume or None)
 
