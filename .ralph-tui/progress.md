@@ -21,6 +21,8 @@ after each iteration and it's included in prompts for context.
   continuations preserve trusted tensors, and terminated slots become discovery queries only on the following frame.
 - Public streaming inference keeps all recurrent neural and host state inside an independent session; output detections
   are built directly from committed active slots so boxes, classes, confidences, and tracker IDs remain slot-aligned.
+- Video clip indexes are built from explicit sequence/frame metadata, never filename order; unknown object identities
+  remain `None`, while known sequence-local identities are validated for per-frame uniqueness and category stability.
 
 ---
 
@@ -163,4 +165,23 @@ after each iteration and it's included in prompts for context.
   - The focused session suite passes through the isolated dependency-shim harness (6 tests). Ordinary host collection
     remains blocked by incompatible/missing `transformers`, `deprecate`, and `supervision` packages. Python compilation,
     Ruff lint/format, and `git diff --check` pass; `mypy` and `pre-commit` are unavailable.
+---
+
+## 2026-07-27 - US-009
+- Added frozen video object, frame, and clip schemas plus deterministic fixed-length sliding-window indexing over
+  explicit sequence IDs and source-frame indices.
+- Validated required identity/provenance fields, preserved unknown identities as `None`, rejected ambiguous frame
+  positions and duplicate per-frame identities, and enforced category stability for known sequence-local tracks.
+- Supported both project-facing and COCO-video metadata names without consulting filenames, and exposed the indexing
+  boundary through the datasets package.
+- Files changed: `src/rfdetr/datasets/video.py`, `src/rfdetr/datasets/__init__.py`,
+  `tests/datasets/test_video.py`, `.ralph-tui/progress.md`.
+- **Learnings:**
+  - Explicit JSON `null` is a useful distinction from an absent `track_id`: the former means identity is unknown, while
+    the latter is a schema error that could otherwise invite accidental filename- or frame-based identity synthesis.
+  - Sequence-local category consistency catches identity reuse mistakes early without incorrectly requiring track IDs
+    to be globally unique across independent sequences.
+  - The focused suite passes through a dependency-isolated package harness (9 tests). Ordinary project collection is
+    blocked first by the incompatible host Transformers package and, with package isolation, by missing `supervision`.
+    Python compilation, Ruff lint/format, and `git diff --check` pass.
 ---
