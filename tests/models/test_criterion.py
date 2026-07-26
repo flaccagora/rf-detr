@@ -8,7 +8,8 @@
 import pytest
 import torch
 
-from rfdetr.models.criterion import SetCriterion
+from rfdetr.models.criterion import SetCriterion, TrackingSetCriterion
+from rfdetr.models.matcher import SequenceAssignment
 
 
 class _MatcherStub:
@@ -16,6 +17,28 @@ class _MatcherStub:
 
     def __call__(self, outputs, targets, group_detr=1):
         return [(torch.arange(len(t["labels"])), torch.arange(len(t["labels"]))) for t in targets]
+
+
+class _RecordingMatcher(_MatcherStub):
+    """Matcher stub that records the output dictionaries it receives."""
+
+    def __init__(self) -> None:
+        """Initialize an empty call log."""
+        self.calls: list[dict[str, torch.Tensor]] = []
+
+    def __call__(self, outputs, targets, group_detr=1):
+        self.calls.append(outputs)
+        return super().__call__(outputs, targets, group_detr)
+
+
+def _sequence_assignment() -> SequenceAssignment:
+    """Return one assignment with a continuation and a newborn discovery."""
+    return SequenceAssignment(
+        continuing_indices=(torch.tensor([0]), torch.tensor([1])),
+        discovery_indices=(torch.tensor([2]), torch.tensor([0])),
+        absent_query_indices=torch.tensor([1]),
+        slot_track_ids=(20, 10, 30),
+    )
 
 
 def _bare_criterion() -> SetCriterion:
@@ -132,3 +155,129 @@ class TestLossMasksEmptyMatch:
         assert spatial_features.grad is not None
         assert query_features.grad is not None
         assert bias.grad is not None
+
+
+class TestTrackingSetCriterion:
+    """Behavioral coverage for loss evaluation with sequence assignments."""
+
+    def test_decoder_layers_reuse_precomputed_sequence_assignment(self) -> None:
+        """Final and auxiliary decoder losses use fixed sequence matches without rematching."""
+        matcher = _MatcherStub()
+        criterion = TrackingSetCriterion(
+            num_classes=2,
+            matcher=matcher,
+            weight_dict={},
+            focal_alpha=0.25,
+            losses=["boxes"],
+        )
+        outputs = {
+            "pred_logits": torch.zeros(1, 3, 2),
+            "pred_boxes": torch.tensor([[[0.8, 0.5, 0.1, 0.1], [0.4, 0.5, 0.1, 0.1], [0.2, 0.5, 0.1, 0.1]]]),
+            "aux_outputs": [
+                {
+                    "pred_logits": torch.zeros(1, 3, 2),
+                    "pred_boxes": torch.tensor([[[0.7, 0.5, 0.1, 0.1], [0.4, 0.5, 0.1, 0.1], [0.3, 0.5, 0.1, 0.1]]]),
+                }
+            ],
+        }
+        targets = [
+            {
+                "labels": torch.tensor([0, 1]),
+                "boxes": torch.tensor([[0.2, 0.5, 0.1, 0.1], [0.8, 0.5, 0.1, 0.1]]),
+            }
+        ]
+
+        losses = criterion(outputs, targets, assignments=[_sequence_assignment()])
+
+        assert losses["loss_bbox"].item() == pytest.approx(0.0)
+        assert losses["loss_bbox_0"].item() == pytest.approx(0.1)
+
+    def test_encoder_losses_keep_ordinary_frame_matching(self) -> None:
+        """Only encoder proposals invoke the ordinary matcher."""
+        matcher = _RecordingMatcher()
+        criterion = TrackingSetCriterion(
+            num_classes=2,
+            matcher=matcher,
+            weight_dict={},
+            focal_alpha=0.25,
+            losses=["boxes"],
+        )
+        encoder_outputs = {
+            "pred_logits": torch.zeros(1, 2, 2),
+            "pred_boxes": torch.tensor([[[0.2, 0.5, 0.1, 0.1], [0.8, 0.5, 0.1, 0.1]]]),
+        }
+        outputs = {
+            "pred_logits": torch.zeros(1, 3, 2),
+            "pred_boxes": torch.zeros(1, 3, 4),
+            "enc_outputs": encoder_outputs,
+        }
+        targets = [
+            {
+                "labels": torch.tensor([0, 1]),
+                "boxes": torch.tensor([[0.2, 0.5, 0.1, 0.1], [0.8, 0.5, 0.1, 0.1]]),
+            }
+        ]
+
+        losses = criterion(outputs, targets, assignments=[_sequence_assignment()])
+
+        assert matcher.calls == [encoder_outputs]
+        assert losses["loss_bbox_enc"].item() == pytest.approx(0.0)
+
+    def test_empty_frame_box_losses_are_finite(self) -> None:
+        """Empty frames clamp normalization and regress no absent slots."""
+        criterion = TrackingSetCriterion(
+            num_classes=2,
+            matcher=_MatcherStub(),
+            weight_dict={},
+            focal_alpha=0.25,
+            losses=["boxes"],
+        )
+        empty = torch.empty(0, dtype=torch.int64)
+        assignment = SequenceAssignment(
+            continuing_indices=(empty, empty),
+            discovery_indices=(empty, empty),
+            absent_query_indices=torch.tensor([0]),
+            slot_track_ids=(10,),
+        )
+        outputs = {
+            "pred_logits": torch.zeros(1, 1, 2),
+            "pred_boxes": torch.zeros(1, 1, 4),
+        }
+        targets = [{"labels": empty, "boxes": torch.empty(0, 4)}]
+
+        losses = criterion(outputs, targets, assignments=[assignment])
+
+        assert losses["loss_bbox"].item() == pytest.approx(0.0)
+        assert losses["loss_giou"].item() == pytest.approx(0.0)
+
+    def test_absent_slot_is_classified_as_negative_without_box_target(self) -> None:
+        """An absent persistent slot gets no-object evidence but no box regression."""
+        criterion = TrackingSetCriterion(
+            num_classes=1,
+            matcher=_MatcherStub(),
+            weight_dict={},
+            focal_alpha=0.25,
+            losses=["labels", "boxes"],
+        )
+        empty = torch.empty(0, dtype=torch.int64)
+        assignment = SequenceAssignment(
+            continuing_indices=(torch.tensor([0]), torch.tensor([0])),
+            discovery_indices=(empty, empty),
+            absent_query_indices=torch.tensor([1]),
+            slot_track_ids=(10, 20),
+        )
+        targets = [{"labels": torch.tensor([0]), "boxes": torch.tensor([[0.5, 0.5, 0.2, 0.2]])}]
+
+        def evaluate(absent_logit: float) -> dict[str, torch.Tensor]:
+            outputs = {
+                "pred_logits": torch.tensor([[[10.0], [absent_logit]]]),
+                "pred_boxes": torch.tensor([[[0.5, 0.5, 0.2, 0.2], [0.0, 0.0, 1.0, 1.0]]]),
+            }
+            return criterion(outputs, targets, assignments=[assignment])
+
+        negative_absent = evaluate(-10.0)
+        positive_absent = evaluate(10.0)
+
+        assert negative_absent["loss_ce"] < positive_absent["loss_ce"]
+        assert positive_absent["loss_bbox"].item() == pytest.approx(0.0)
+        assert positive_absent["loss_giou"].item() == pytest.approx(0.0)

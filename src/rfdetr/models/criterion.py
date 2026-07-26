@@ -23,6 +23,7 @@ from rfdetr.models.heads.segmentation import (
     get_uncertain_point_coords_with_randomness,
     point_sample,
 )
+from rfdetr.models.matcher import SequenceAssignment
 from rfdetr.models.math import accuracy
 from rfdetr.utilities import box_ops
 from rfdetr.utilities.distributed import get_world_size, is_dist_avail_and_initialized
@@ -700,5 +701,69 @@ class SetCriterion(nn.Module):
                 l_dict = self.get_loss(loss, enc_outputs, targets, indices, num_boxes, **kwargs)
                 l_dict = {k + "_enc": v for k, v in l_dict.items()}
                 losses.update(l_dict)
+
+        return losses
+
+
+class TrackingSetCriterion(SetCriterion):
+    """Evaluate existing detection losses with identity-aware decoder assignments."""
+
+    def forward(
+        self,
+        outputs: dict[str, Any],
+        targets: list[dict[str, torch.Tensor]],
+        assignments: list[SequenceAssignment],
+        num_boxes: torch.Tensor | float | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Compute detection losses using fixed sequence assignments.
+
+        Decoder losses reuse the supplied identity-aware assignments at every
+        decoder layer. Encoder proposals remain frame-local and therefore retain
+        ordinary Hungarian matching. Persistent slots absent from the target
+        frame are unmatched: classification treats them as negatives, and box
+        losses receive no nonexistent target.
+
+        Args:
+            outputs: Tracking-frame model outputs.
+            targets: Per-item targets for the current sequence frame.
+            assignments: Precomputed identity-aware assignments aligned with the
+                batch and decoder query slots.
+            num_boxes: Optional explicit loss denominator.
+
+        Returns:
+            Existing RF-DETR loss terms, including auxiliary and encoder suffixes.
+
+        Raises:
+            ValueError: If assignments do not align with the target batch.
+        """
+        if len(assignments) != len(targets):
+            raise ValueError("assignments and targets must have the same batch size")
+
+        decoder_indices = [assignment.decoder_indices for assignment in assignments]
+        if num_boxes is None:
+            num_boxes = self.num_boxes_for_targets(outputs, targets)
+        elif not torch.is_tensor(num_boxes):
+            num_boxes = torch.as_tensor(num_boxes, dtype=torch.float, device=self._output_device(outputs))
+        else:
+            num_boxes = num_boxes.to(device=self._output_device(outputs), dtype=torch.float)
+
+        losses: dict[str, torch.Tensor] = {}
+        for loss in self.losses:
+            losses.update(self.get_loss(loss, outputs, targets, decoder_indices, num_boxes))
+
+        for layer_index, aux_outputs in enumerate(outputs.get("aux_outputs", [])):
+            for loss in self.losses:
+                kwargs = {"log": False} if loss == "labels" else {}
+                layer_losses = self.get_loss(loss, aux_outputs, targets, decoder_indices, num_boxes, **kwargs)
+                losses.update({name + f"_{layer_index}": value for name, value in layer_losses.items()})
+
+        if "enc_outputs" in outputs:
+            encoder_outputs = outputs["enc_outputs"]
+            group_detr = self.group_detr if self.training else 1
+            encoder_indices = self.matcher(encoder_outputs, targets, group_detr=group_detr)
+            for loss in self.losses:
+                kwargs = {"log": False} if loss == "labels" else {}
+                encoder_losses = self.get_loss(loss, encoder_outputs, targets, encoder_indices, num_boxes, **kwargs)
+                losses.update({name + "_enc": value for name, value in encoder_losses.items()})
 
         return losses

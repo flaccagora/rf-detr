@@ -15,7 +15,7 @@
 
 from rfdetr.models._defaults import MODEL_DEFAULTS, ModelDefaults
 from rfdetr.models._types import BuilderArgs
-from rfdetr.models.criterion import SetCriterion
+from rfdetr.models.criterion import SetCriterion, TrackingSetCriterion
 from rfdetr.models.lwdetr import build_criterion_from_config, build_model, build_model_from_config
 from rfdetr.models.math import MLP
 from rfdetr.models.postprocess import PostProcess
@@ -26,6 +26,7 @@ __all__ = [
     "MODEL_DEFAULTS",
     "ModelDefaults",
     "SetCriterion",
+    "TrackingSetCriterion",
     "build_criterion_from_config",
     "build_model",
     "build_model_from_config",

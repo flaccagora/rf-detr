@@ -27,6 +27,8 @@ after each iteration and it's included in prompts for context.
   as one ordinary `NestedTensor` batch per step so the existing backbone can be reused unchanged during unroll.
 - Sequence assignment first binds visible known identities to their persistent slots, then runs the ordinary Hungarian
   matcher on the residual target/discovery-slot subproblem; unknown identities remain non-persistent.
+- Tracking criteria reuse one precomputed sequence assignment for the final and every auxiliary decoder layer; encoder
+  proposal losses remain frame-local and use the ordinary matcher, while unmatched absent slots are classification-only.
 
 ---
 
@@ -223,4 +225,21 @@ after each iteration and it's included in prompts for context.
   - Ordinary pytest collection remains blocked by the host Transformers package lacking `BackboneConfigMixin`, and `uv`
     cannot use its read-only cache. Dependency-isolated assignment checks, Python compilation, Ruff lint/format, and
     `git diff --check` pass.
+---
+
+## 2026-07-27 - US-012
+- Added `TrackingSetCriterion`, which evaluates existing RF-DETR classification, box, GIoU, and auxiliary decoder
+  losses with precomputed identity-aware sequence assignments while retaining ordinary encoder proposal matching.
+- Kept absent/suspended persistent slots unmatched so existing focal classification supervises them as negatives
+  without box regression, and preserved the existing clamped target-count normalization for empty/varying frames.
+- Files changed: `src/rfdetr/models/criterion.py`, `src/rfdetr/models/__init__.py`,
+  `tests/models/test_criterion.py`, `.ralph-tui/progress.md`.
+- **Learnings:**
+  - One decoder assignment must be shared across auxiliary layers; rematching auxiliary predictions would silently
+    weaken the fixed-slot identity constraint even if the final decoder layer remained identity-aware.
+  - Existing unmatched-query focal supervision already provides the required absent-slot classification treatment;
+    excluding absent slots from assignment is sufficient to prevent regression against nonexistent targets.
+  - The dependency-isolated focused criterion suite passes (12 tests). Ordinary collection remains blocked by the host
+    Transformers package lacking `BackboneConfigMixin`; Python compilation, Ruff lint/format, and `git diff --check`
+    pass, while `uv` cannot use its read-only global cache.
 ---
