@@ -14,6 +14,7 @@ from torch import nn
 
 from rfdetr.models.ops.functions import ms_deform_attn_core_pytorch
 from rfdetr.models.ops.modules.ms_deform_attn import MSDeformAttn
+from rfdetr.models.tracking import TrackQueryState
 from rfdetr.models.transformer import (
     Transformer,
     gen_encoder_output_proposals,
@@ -120,6 +121,62 @@ def test_two_stage_discovery_initialization_selects_ranked_encoder_proposals(
     )
     assert initialization.decoder_refpoints.requires_grad is False
     assert initialization.query_features.requires_grad is True
+
+
+@pytest.mark.parametrize(
+    "bbox_reparam",
+    [
+        pytest.param(True, id="reparameterized-boxes"),
+        pytest.param(False, id="legacy-logit-boxes"),
+    ],
+)
+def test_tracking_query_composition_replaces_only_active_slots(
+    bbox_reparam: bool,
+) -> None:
+    """Prior state replaces active slots while inactive slots retain image discovery."""
+    transformer = Transformer(
+        d_model=2,
+        sa_nhead=1,
+        ca_nhead=1,
+        num_queries=3,
+        num_decoder_layers=0,
+        dim_feedforward=4,
+        bbox_reparam=bbox_reparam,
+    )
+    discovery_features = torch.tensor(
+        [
+            [[1.0, 1.0], [2.0, 2.0], [3.0, 3.0]],
+            [[4.0, 4.0], [5.0, 5.0], [6.0, 6.0]],
+        ]
+    )
+    discovery_refpoints = torch.tensor(
+        [
+            [[0.1, 0.1, 0.1, 0.1], [0.2, 0.2, 0.2, 0.2], [0.3, 0.3, 0.3, 0.3]],
+            [[0.4, 0.4, 0.4, 0.4], [0.5, 0.5, 0.5, 0.5], [0.6, 0.6, 0.6, 0.6]],
+        ]
+    )
+    prior_features = discovery_features + 10
+    prior_boxes = torch.tensor(
+        [
+            [[0.15, 0.15, 0.15, 0.15], [0.25, 0.25, 0.25, 0.25], [0.35, 0.35, 0.35, 0.35]],
+            [[0.45, 0.45, 0.45, 0.45], [0.55, 0.55, 0.55, 0.55], [0.65, 0.65, 0.65, 0.65]],
+        ]
+    )
+    active_mask = torch.tensor([[True, False, True], [False, True, False]])
+    prior_state = TrackQueryState(prior_features, prior_boxes, active_mask)
+
+    initialization = transformer._compose_tracking_queries(
+        discovery_features,
+        discovery_refpoints,
+        prior_state,
+    )
+
+    expected_features = torch.where(active_mask.unsqueeze(-1), prior_features, discovery_features)
+    prior_refpoints = normalized_boxes_to_refpoints(prior_boxes, bbox_reparam=bbox_reparam)
+    expected_refpoints = torch.where(active_mask.unsqueeze(-1), prior_refpoints, discovery_refpoints)
+    torch.testing.assert_close(initialization.query_features, expected_features)
+    torch.testing.assert_close(initialization.decoder_refpoints, expected_refpoints)
+    assert torch.equal(initialization.active_mask, active_mask)
 
 
 def _build_ms_deform_inputs(

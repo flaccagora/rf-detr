@@ -13,6 +13,8 @@ after each iteration and it's included in prompts for context.
   `cxcywh`, while legacy additive models receive numerically stable inverse-sigmoid references.
 - Two-stage discovery selection is isolated in `_initialize_two_stage_discovery`; it returns one frozen, slot-aligned
   bundle containing detached decoder references plus differentiable query features and encoder-loss boxes.
+- Persistent/discovery query composition is a fixed-shape `torch.where` selection over a per-item active mask; prior
+  normalized boxes cross the parameterization boundary before selection, while inactive slots remain untouched.
 
 ---
 
@@ -81,4 +83,21 @@ after each iteration and it's included in prompts for context.
   - Focused pytest collection remains blocked by the host Transformers package lacking `BackboneConfigMixin`; after a
     narrow compatibility shim, collection reaches a second missing host dependency (`deprecate`). Python compilation,
     Ruff lint/format, and `git diff --check` pass.
+---
+
+## 2026-07-27 - US-005
+- Added a validated transformer composition boundary that replaces active decoder slots with prior query features and
+  parameterization-correct prior box references while retaining current-frame discovery initialization in inactive
+  slots.
+- Added behavioral coverage for mixed per-batch role maps and both reparameterized and legacy decoder references.
+- Files changed: `src/rfdetr/models/transformer.py`, `tests/models/test_transformer.py`,
+  `.ralph-tui/progress.md`.
+- **Learnings:**
+  - Query persistence is a masked fixed-slot selection, so batches may have different active counts without changing
+    decoder tensor shapes or concatenating variable-length state.
+  - Recurrent normalized boxes must be converted before masked composition; discovery references are already in the
+    decoder's internal parameterization and must remain unchanged.
+  - Focused pytest collection remains blocked by the incompatible host Transformers package and then missing
+    `supervision`, even with narrow compatibility shims. Isolated runtime checks pass in both box modes, as do Python
+    compilation, Ruff lint/format, and `git diff --check`; `mypy` and `pre-commit` are unavailable.
 ---

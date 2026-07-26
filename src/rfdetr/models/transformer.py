@@ -27,6 +27,7 @@ from rfdetr.models._types import BuilderArgs
 from rfdetr.models.heads.keypoints import ConditionalQueryInitializer
 from rfdetr.models.math import MLP, inverse_sigmoid
 from rfdetr.models.ops.modules import MSDeformAttn
+from rfdetr.models.tracking import TrackQueryState
 
 
 @dataclass(frozen=True)
@@ -42,6 +43,15 @@ class _TwoStageDiscoveryInitialization:
     decoder_refpoints: Tensor
     query_features: Tensor
     encoder_boxes: Tensor
+
+
+@dataclass(frozen=True)
+class _TrackingQueryInitialization:
+    """Fixed-shape decoder initialization composed from discovery and prior state."""
+
+    decoder_refpoints: Tensor
+    query_features: Tensor
+    active_mask: Tensor
 
 
 def _safe_multinormalize(dim: int) -> int:
@@ -347,6 +357,56 @@ class Transformer(nn.Module):
             decoder_refpoints=torch.cat(decoder_refpoints, dim=1),
             query_features=torch.cat(query_features, dim=1),
             encoder_boxes=torch.cat(encoder_boxes, dim=1),
+        )
+
+    def _compose_tracking_queries(
+        self,
+        discovery_features: Tensor,
+        discovery_refpoints: Tensor,
+        prior_state: TrackQueryState,
+    ) -> _TrackingQueryInitialization:
+        """Replace active discovery slots with aligned recurrent query state.
+
+        Args:
+            discovery_features: Normal current-frame decoder query features.
+            discovery_refpoints: Normal current-frame decoder references.
+            prior_state: Normalized recurrent state and per-item active role map.
+
+        Returns:
+            Fixed-shape query features, decoder references, and input role map.
+
+        Raises:
+            ValueError: If discovery tensors are not aligned with prior state.
+            TypeError: If discovery tensors are incompatible with state dtypes.
+        """
+        slot_shape = prior_state.active_mask.shape
+        if discovery_features.ndim != 3 or discovery_features.shape[:2] != slot_shape:
+            raise ValueError("discovery_features and prior_state must be slot-aligned")
+        if discovery_refpoints.ndim != 3 or discovery_refpoints.shape != (*slot_shape, 4):
+            raise ValueError("discovery_refpoints and prior_state must be slot-aligned")
+        if discovery_features.shape[-1] != prior_state.query_features.shape[-1]:
+            raise ValueError("discovery_features and prior query features must have the same hidden dimension")
+        if discovery_features.dtype != prior_state.query_features.dtype:
+            raise TypeError("discovery_features and prior query features must have the same dtype")
+        if discovery_refpoints.dtype != prior_state.reference_boxes.dtype:
+            raise TypeError("discovery_refpoints and prior reference boxes must have the same dtype")
+        devices = {
+            discovery_features.device,
+            discovery_refpoints.device,
+            prior_state.active_mask.device,
+        }
+        if len(devices) != 1:
+            raise ValueError("discovery initialization and prior_state must be on the same device")
+
+        active_mask = prior_state.active_mask.unsqueeze(-1)
+        prior_refpoints = normalized_boxes_to_refpoints(
+            prior_state.reference_boxes,
+            bbox_reparam=self.bbox_reparam,
+        )
+        return _TrackingQueryInitialization(
+            decoder_refpoints=torch.where(active_mask, prior_refpoints, discovery_refpoints),
+            query_features=torch.where(active_mask, prior_state.query_features, discovery_features),
+            active_mask=prior_state.active_mask,
         )
 
     def forward(
