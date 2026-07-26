@@ -1,0 +1,15 @@
+{
+  "id": "295f5a6d-1c33-4458-aa27-6b674182206a",
+  "status": "running",
+  "startedAt": "2026-07-26T22:23:40.395Z",
+  "updatedAt": "2026-07-26T22:23:40.395Z",
+  "agentPlugin": "codex",
+  "trackerPlugin": "json",
+  "executionScopes": [],
+  "prdPath": "/home/flaccagora/Desktop/clevis/submodules/rf-detr/tasks/persistent-track-queries.json",
+  "currentIteration": 0,
+  "maxIterations": 1,
+  "totalTasks": 0,
+  "tasksCompleted": 0,
+  "cwd": "/home/flaccagora/Desktop/clevis/submodules/rf-detr"
+}

@@ -1,0 +1,121 @@
+{
+  "version": 1,
+  "sessionId": "295f5a6d-1c33-4458-aa27-6b674182206a",
+  "status": "running",
+  "startedAt": "2026-07-26T22:23:40.537Z",
+  "updatedAt": "2026-07-26T22:27:17.625Z",
+  "currentIteration": 0,
+  "maxIterations": 1,
+  "tasksCompleted": 0,
+  "isPaused": false,
+  "agentPlugin": "codex",
+  "trackerState": {
+    "plugin": "json",
+    "executionScopes": [],
+    "prdPath": "/home/flaccagora/Desktop/clevis/submodules/rf-detr/tasks/persistent-track-queries.json",
+    "totalTasks": 16,
+    "tasks": [
+      {
+        "id": "US-001",
+        "title": "Add tracking configuration and capability validation",
+        "status": "open",
+        "completedInSession": false
+      },
+      {
+        "id": "US-002",
+        "title": "Define neural state and frame-output contracts",
+        "status": "open",
+        "completedInSession": false
+      },
+      {
+        "id": "US-003",
+        "title": "Centralize normalized reference conversion",
+        "status": "open",
+        "completedInSession": false
+      },
+      {
+        "id": "US-004",
+        "title": "Refactor two-stage discovery initialization",
+        "status": "open",
+        "completedInSession": false
+      },
+      {
+        "id": "US-005",
+        "title": "Compose persistent and discovery queries",
+        "status": "open",
+        "completedInSession": false
+      },
+      {
+        "id": "US-006",
+        "title": "Add `LWDETR.forward_tracking`",
+        "status": "open",
+        "completedInSession": false
+      },
+      {
+        "id": "US-007",
+        "title": "Implement pure lifecycle transitions",
+        "status": "open",
+        "completedInSession": false
+      },
+      {
+        "id": "US-008",
+        "title": "Add a public single-stream tracking session",
+        "status": "open",
+        "completedInSession": false
+      },
+      {
+        "id": "US-009",
+        "title": "Add video annotation schema and dataset indexing",
+        "status": "open",
+        "completedInSession": false
+      },
+      {
+        "id": "US-010",
+        "title": "Add sequence collation and shared transforms",
+        "status": "open",
+        "completedInSession": false
+      },
+      {
+        "id": "US-011",
+        "title": "Implement identity-aware sequence assignment",
+        "status": "open",
+        "completedInSession": false
+      },
+      {
+        "id": "US-012",
+        "title": "Add the tracking-aware criterion",
+        "status": "open",
+        "completedInSession": false
+      },
+      {
+        "id": "US-013",
+        "title": "Add recurrent video training and validation steps",
+        "status": "open",
+        "completedInSession": false
+      },
+      {
+        "id": "US-014",
+        "title": "Preserve checkpoint and image-inference compatibility",
+        "status": "open",
+        "completedInSession": false
+      },
+      {
+        "id": "US-015",
+        "title": "Add sequence evaluation output",
+        "status": "open",
+        "completedInSession": false
+      },
+      {
+        "id": "US-017",
+        "title": "Add performance and unsupported-export guardrails",
+        "status": "open",
+        "completedInSession": false
+      }
+    ]
+  },
+  "iterations": [],
+  "skippedTaskIds": [],
+  "cwd": "/home/flaccagora/Desktop/clevis/submodules/rf-detr",
+  "activeTaskIds": [],
+  "subagentPanelVisible": false
+}

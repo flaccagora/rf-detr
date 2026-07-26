@@ -99,6 +99,72 @@ class BaseConfig(BaseModel):
         raise ValueError(f"Unknown attribute: '{name}'.")
 
 
+class TrackingConfig(BaseConfig):
+    """Persistent-query architecture and fixed-capacity configuration.
+
+    Attributes:
+        enabled: Enable the persistent-query model path. Existing image models
+            remain stateless by default.
+        max_active_tracks: Maximum query slots that may carry tracks. ``None``
+            uses all slots not reserved for discovery.
+        discovery_reserve: Minimum query slots kept available for discovering
+            new objects.
+    """
+
+    enabled: bool = False
+    max_active_tracks: int | None = Field(default=None, ge=1)
+    discovery_reserve: int = Field(default=1, ge=1)
+
+    def active_capacity(self, num_queries: int) -> int:
+        """Return the effective active-track capacity for a model.
+
+        Args:
+            num_queries: Fixed number of decoder query slots.
+
+        Returns:
+            Explicit capacity, or the capacity left after the discovery reserve.
+        """
+        if self.max_active_tracks is not None:
+            return self.max_active_tracks
+        return num_queries - self.discovery_reserve
+
+
+class TrackingTrainConfig(BaseConfig):
+    """Settings that apply only to causal video-training clips.
+
+    Attributes:
+        clip_length: Number of chronological frames in each training clip. A
+            value of one preserves ordinary image-training behavior.
+        detach_state_between_frames: Whether recurrent query state is detached
+            between adjacent frames.
+        lifecycle_mode: Policy used to commit state while training.
+    """
+
+    clip_length: int = Field(default=1, ge=1)
+    detach_state_between_frames: bool = False
+    lifecycle_mode: Literal["assignment_guided", "inference_like"] = "assignment_guided"
+
+
+class TrackingSessionConfig(BaseConfig):
+    """Inference lifecycle policy for a single tracking session.
+
+    Attributes:
+        activation_threshold: Minimum confidence for activating a discovery
+            query as a track.
+        continuation_threshold: Minimum confidence for committing an updated
+            state for an existing track.
+        duplicate_iou_threshold: IoU above which a same-class discovery is
+            treated as a duplicate.
+        max_missed_frames: Number of missed source frames tolerated before a
+            suspended track is terminated.
+    """
+
+    activation_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
+    continuation_threshold: float = Field(default=0.3, ge=0.0, le=1.0)
+    duplicate_iou_threshold: float = Field(default=0.7, ge=0.0, le=1.0)
+    max_missed_frames: int = Field(default=30, ge=0)
+
+
 class ModelConfig(BaseConfig):
     """Core architecture configuration for RF-DETR models.
 
@@ -139,6 +205,8 @@ class ModelConfig(BaseConfig):
         device: Target device string (e.g. ``"cuda"``, ``"cpu"``). Auto-detected if not set.
         gradient_checkpointing: Trade compute for memory by checkpointing activations. Defaults
             to ``False``.
+        tracking: Persistent-query architecture and capacity settings. Tracking
+            is disabled by default.
     """
 
     encoder: EncoderName
@@ -197,6 +265,39 @@ class ModelConfig(BaseConfig):
             "without inspecting ``pretrain_weights``."
         ),
     )
+    tracking: TrackingConfig = Field(default_factory=TrackingConfig)
+
+    @model_validator(mode="after")
+    def _validate_tracking_capabilities(self) -> "ModelConfig":
+        """Reject architectures unsupported by persistent-query tracking.
+
+        Returns:
+            The validated model configuration.
+
+        Raises:
+            ValueError: If enabled tracking is combined with a non-detection
+                head, one-stage proposals, grouped queries, or invalid capacity.
+        """
+        if not self.tracking.enabled:
+            return self
+        if self.segmentation_head or self.use_grouppose_keypoints:
+            raise ValueError(
+                "Persistent-query tracking currently supports detection-only models; "
+                "segmentation_head and use_grouppose_keypoints must both be False."
+            )
+        if not self.two_stage:
+            raise ValueError("Persistent-query tracking requires two_stage=True for discovery proposals.")
+        if self.group_detr != 1:
+            raise ValueError("Persistent-query tracking requires group_detr=1 for stable query identity.")
+
+        active_capacity = self.tracking.active_capacity(self.num_queries)
+        if active_capacity < 1 or active_capacity + self.tracking.discovery_reserve > self.num_queries:
+            raise ValueError(
+                "Tracking max_active_tracks "
+                f"({active_capacity}) plus discovery_reserve ({self.tracking.discovery_reserve}) "
+                f"must not exceed num_queries ({self.num_queries})."
+            )
+        return self
 
     @model_validator(mode="after")
     def _warn_deprecated_model_config_fields(self) -> "ModelConfig":
@@ -705,6 +806,7 @@ class TrainConfig(BaseConfig):
     # RFDETR.train() (resolution/device/callbacks/start_epoch/do_benchmark) are popped before construction.
     model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid", validate_assignment=True)
 
+    tracking: TrackingTrainConfig = Field(default_factory=TrackingTrainConfig)
     lr: float = 1e-4
     lr_encoder: float = 1.5e-4
     batch_size: int | Literal["auto"] = 4
