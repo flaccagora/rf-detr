@@ -17,6 +17,7 @@
 import copy
 import math
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F  # noqa: N812
@@ -26,6 +27,21 @@ from rfdetr.models._types import BuilderArgs
 from rfdetr.models.heads.keypoints import ConditionalQueryInitializer
 from rfdetr.models.math import MLP, inverse_sigmoid
 from rfdetr.models.ops.modules import MSDeformAttn
+
+
+@dataclass(frozen=True)
+class _TwoStageDiscoveryInitialization:
+    """Ranked encoder state used to initialize two-stage discovery queries.
+
+    Attributes:
+        decoder_refpoints: Detached box references used to initialize the decoder.
+        query_features: Selected encoder features aligned with the references.
+        encoder_boxes: Non-detached selected boxes used by encoder training losses.
+    """
+
+    decoder_refpoints: Tensor
+    query_features: Tensor
+    encoder_boxes: Tensor
 
 
 def _safe_multinormalize(dim: int) -> int:
@@ -274,6 +290,65 @@ class Transformer(nn.Module):
         valid_ratio = torch.stack([valid_ratio_w, valid_ratio_h], -1)
         return valid_ratio
 
+    def _initialize_two_stage_discovery(
+        self,
+        memory: Tensor,
+        memory_padding_mask: Tensor | None,
+        spatial_shapes: Sequence[tuple[int, int]] | Tensor,
+    ) -> _TwoStageDiscoveryInitialization:
+        """Select ranked current-frame proposals for two-stage discovery slots.
+
+        Args:
+            memory: Flattened multi-level image features.
+            memory_padding_mask: Optional flattened padding mask.
+            spatial_shapes: Height and width for each feature level.
+
+        Returns:
+            Aligned decoder references, query features, and encoder-loss boxes.
+
+        Raises:
+            RuntimeError: If called on a transformer without two-stage heads.
+        """
+        if not self.two_stage:
+            raise RuntimeError("Two-stage discovery initialization requires two_stage=True.")
+
+        output_memory, output_proposals = gen_encoder_output_proposals(
+            memory,
+            memory_padding_mask,
+            spatial_shapes,
+            unsigmoid=not self.bbox_reparam,
+        )
+        decoder_refpoints = []
+        query_features = []
+        encoder_boxes = []
+        group_detr = self.group_detr if self.training else 1
+        for group_index in range(group_detr):
+            group_memory = self.enc_output_norm[group_index](self.enc_output[group_index](output_memory))
+            class_logits = self.enc_out_class_embed[group_index](group_memory)
+            if self.bbox_reparam:
+                box_delta = self.enc_out_bbox_embed[group_index](group_memory)
+                box_centers = box_delta[..., :2] * output_proposals[..., 2:] + output_proposals[..., :2]
+                box_sizes = box_delta[..., 2:].exp() * output_proposals[..., 2:]
+                unselected_boxes = torch.concat([box_centers, box_sizes], dim=-1)
+            else:
+                unselected_boxes = self.enc_out_bbox_embed[group_index](group_memory) + output_proposals
+
+            topk = min(self.num_queries, class_logits.shape[-2])
+            proposal_indices = torch.topk(class_logits.max(-1)[0], topk, dim=1)[1]
+            box_indices = proposal_indices.unsqueeze(-1).repeat(1, 1, 4)
+            selected_boxes = torch.gather(unselected_boxes, 1, box_indices)
+            feature_indices = proposal_indices.unsqueeze(-1).repeat(1, 1, self.d_model)
+
+            decoder_refpoints.append(selected_boxes.detach())
+            query_features.append(torch.gather(group_memory, 1, feature_indices))
+            encoder_boxes.append(selected_boxes)
+
+        return _TwoStageDiscoveryInitialization(
+            decoder_refpoints=torch.cat(decoder_refpoints, dim=1),
+            query_features=torch.cat(query_features, dim=1),
+            encoder_boxes=torch.cat(encoder_boxes, dim=1),
+        )
+
     def forward(
         self,
         srcs: list[Tensor],
@@ -329,52 +404,14 @@ class Transformer(nn.Module):
             cross_attn_memory = torch.cat(ca_flatten, 1)
 
         if self.two_stage:
-            output_memory, output_proposals = gen_encoder_output_proposals(
-                memory, mask_flatten, spatial_shapes_hw, unsigmoid=not self.bbox_reparam
+            discovery = self._initialize_two_stage_discovery(
+                memory,
+                mask_flatten,
+                spatial_shapes_hw,
             )
-            # group detr for first stage
-            refpoint_embed_ts, memory_ts, boxes_ts = [], [], []
-            group_detr = self.group_detr if self.training else 1
-            for g_idx in range(group_detr):
-                output_memory_gidx = self.enc_output_norm[g_idx](self.enc_output[g_idx](output_memory))
-
-                enc_outputs_class_unselected_gidx = self.enc_out_class_embed[g_idx](output_memory_gidx)
-                if self.bbox_reparam:
-                    enc_outputs_coord_delta_gidx = self.enc_out_bbox_embed[g_idx](output_memory_gidx)
-                    enc_outputs_coord_cxcy_gidx = (
-                        enc_outputs_coord_delta_gidx[..., :2] * output_proposals[..., 2:] + output_proposals[..., :2]
-                    )
-                    enc_outputs_coord_wh_gidx = enc_outputs_coord_delta_gidx[..., 2:].exp() * output_proposals[..., 2:]
-                    enc_outputs_coord_unselected_gidx = torch.concat(
-                        [enc_outputs_coord_cxcy_gidx, enc_outputs_coord_wh_gidx], dim=-1
-                    )
-                else:
-                    enc_outputs_coord_unselected_gidx = (
-                        self.enc_out_bbox_embed[g_idx](output_memory_gidx) + output_proposals
-                    )
-
-                topk = min(self.num_queries, enc_outputs_class_unselected_gidx.shape[-2])
-                topk_proposals_gidx = torch.topk(enc_outputs_class_unselected_gidx.max(-1)[0], topk, dim=1)[1]  # bs, nq
-
-                refpoint_embed_gidx_undetach = torch.gather(
-                    enc_outputs_coord_unselected_gidx, 1, topk_proposals_gidx.unsqueeze(-1).repeat(1, 1, 4)
-                )  # unsigmoid
-                # for decoder layer, detached as initial ones, (bs, nq, 4)
-                refpoint_embed_gidx = refpoint_embed_gidx_undetach.detach()
-
-                # get memory tgt
-                tgt_undetach_gidx = torch.gather(
-                    output_memory_gidx, 1, topk_proposals_gidx.unsqueeze(-1).repeat(1, 1, self.d_model)
-                )
-
-                refpoint_embed_ts.append(refpoint_embed_gidx)
-                memory_ts.append(tgt_undetach_gidx)
-                boxes_ts.append(refpoint_embed_gidx_undetach)
-            # concat on dim=1, the nq dimension, (bs, nq, d) --> (bs, nq, d)
-            refpoint_embed_ts = torch.cat(refpoint_embed_ts, dim=1)
-            # (bs, nq, d)
-            memory_ts = torch.cat(memory_ts, dim=1)
-            boxes_ts = torch.cat(boxes_ts, dim=1)
+            refpoint_embed_ts = discovery.decoder_refpoints
+            memory_ts = discovery.query_features
+            boxes_ts = discovery.encoder_boxes
 
         enc_kp_predictions = None
         init_kp_ref_xy = None

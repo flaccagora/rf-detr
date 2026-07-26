@@ -10,10 +10,12 @@ import io
 import numpy as np
 import pytest
 import torch
+from torch import nn
 
 from rfdetr.models.ops.functions import ms_deform_attn_core_pytorch
 from rfdetr.models.ops.modules.ms_deform_attn import MSDeformAttn
 from rfdetr.models.transformer import (
+    Transformer,
     gen_encoder_output_proposals,
     gen_sineembed_for_position,
     normalized_boxes_to_refpoints,
@@ -57,6 +59,67 @@ def test_normalized_boxes_to_refpoints_uses_decoder_parameterization(
     torch.testing.assert_close(actual, expected)
     assert actual.dtype == boxes.dtype
     assert actual.device == boxes.device
+
+
+@pytest.mark.parametrize(
+    "bbox_reparam",
+    [
+        pytest.param(True, id="reparameterized-boxes"),
+        pytest.param(False, id="legacy-logit-boxes"),
+    ],
+)
+def test_two_stage_discovery_initialization_selects_ranked_encoder_proposals(
+    bbox_reparam: bool,
+) -> None:
+    """Two-stage discovery initialization exposes ranked proposal state for decoder composition."""
+    transformer = Transformer(
+        d_model=4,
+        sa_nhead=1,
+        ca_nhead=1,
+        num_queries=2,
+        num_decoder_layers=0,
+        dim_feedforward=8,
+        group_detr=1,
+        two_stage=True,
+        num_feature_levels=1,
+        bbox_reparam=bbox_reparam,
+    )
+    transformer.enc_output[0] = nn.Identity()
+    transformer.enc_output_norm[0] = nn.Identity()
+    transformer.enc_out_class_embed = nn.ModuleList([nn.Linear(4, 1, bias=False)])
+    transformer.enc_out_bbox_embed = nn.ModuleList([nn.Linear(4, 4, bias=False)])
+    with torch.no_grad():
+        transformer.enc_out_class_embed[0].weight.copy_(torch.tensor([[1.0, 0.0, 0.0, 0.0]]))
+        transformer.enc_out_bbox_embed[0].weight.zero_()
+
+    memory = torch.tensor(
+        [[[1.0, 0.0, 0.0, 0.0], [4.0, 0.0, 0.0, 0.0], [3.0, 0.0, 0.0, 0.0]]],
+        requires_grad=True,
+    )
+    output_memory, proposals = gen_encoder_output_proposals(
+        memory,
+        spatial_shapes=[(1, 3)],
+        unsigmoid=not bbox_reparam,
+    )
+    expected_indices = torch.tensor([1, 2])
+
+    initialization = transformer._initialize_two_stage_discovery(
+        memory,
+        memory_padding_mask=None,
+        spatial_shapes=[(1, 3)],
+    )
+
+    torch.testing.assert_close(initialization.query_features, output_memory[:, expected_indices])
+    torch.testing.assert_close(
+        initialization.decoder_refpoints,
+        proposals[:, expected_indices].detach(),
+    )
+    torch.testing.assert_close(
+        initialization.encoder_boxes,
+        proposals[:, expected_indices],
+    )
+    assert initialization.decoder_refpoints.requires_grad is False
+    assert initialization.query_features.requires_grad is True
 
 
 def _build_ms_deform_inputs(
