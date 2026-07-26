@@ -7,9 +7,13 @@
 
 from __future__ import annotations
 
-import pytest
+import random
 
-from rfdetr.datasets.video import build_video_clip_index
+import numpy as np
+import pytest
+import torch
+
+from rfdetr.datasets.video import SharedSequenceTransform, build_video_clip_index, sequence_collate_fn
 
 
 def _annotations() -> dict[str, list[dict[str, object]]]:
@@ -113,3 +117,60 @@ def test_clip_index_uses_sliding_windows_without_crossing_sequences() -> None:
     clips = build_video_clip_index(data, clip_length=2, stride=1)
 
     assert [clip.image_ids for clip in clips] == [(10, 11), (11, 12), (31, 30)]
+
+
+def test_shared_sequence_transform_reuses_random_parameters_across_frames() -> None:
+    """Every frame in a clip receives the same sampled spatial transform."""
+
+    def transform(image: torch.Tensor, target: dict[str, torch.Tensor]):
+        offset = random.random() + float(np.random.random()) + float(torch.rand(()))
+        return image + offset, {**target, "boxes": target["boxes"] + offset}
+
+    images = (torch.zeros(3, 2, 2), torch.ones(3, 2, 2))
+    targets = ({"boxes": torch.zeros(1, 4)}, {"boxes": torch.ones(1, 4)})
+
+    transformed_images, transformed_targets = SharedSequenceTransform(transform)(images, targets)
+
+    assert torch.allclose(transformed_images[1] - transformed_images[0], torch.ones(3, 2, 2))
+    assert torch.allclose(transformed_targets[1]["boxes"] - transformed_targets[0]["boxes"], torch.ones(1, 4))
+
+
+def test_shared_sequence_transform_replays_transform_owned_rng() -> None:
+    """Transform objects with private generators also share clip geometry."""
+
+    class StatefulTransform:
+        def __init__(self) -> None:
+            self.generator = random.Random(9)
+
+        def __call__(self, image, target):
+            offset = self.generator.random()
+            return image + offset, target
+
+    images, _ = SharedSequenceTransform(StatefulTransform())(
+        (torch.zeros(1), torch.ones(1)),
+        ({}, {}),
+    )
+
+    assert torch.allclose(images[1] - images[0], torch.ones(1))
+
+
+def test_sequence_collation_is_time_major_for_backbone_reuse() -> None:
+    """A clip batch becomes one ordinary nested image batch per chronological step."""
+    batch = [
+        (
+            (torch.full((3, 2, 3), 10.0), torch.full((3, 2, 2), 11.0)),
+            ({"frame_index": 10}, {"frame_index": 11}),
+        ),
+        (
+            (torch.full((3, 1, 2), 20.0), torch.full((3, 2, 4), 21.0)),
+            ({"frame_index": 20}, {"frame_index": 21}),
+        ),
+    ]
+
+    frames, targets = sequence_collate_fn(batch, block_size=2)
+
+    assert len(frames) == 2
+    assert frames[0].tensors.shape == (2, 3, 2, 4)
+    assert frames[1].tensors.shape == (2, 3, 2, 4)
+    assert [target["frame_index"] for target in targets[0]] == [10, 20]
+    assert [target["frame_index"] for target in targets[1]] == [11, 21]

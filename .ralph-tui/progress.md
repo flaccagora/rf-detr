@@ -23,6 +23,8 @@ after each iteration and it's included in prompts for context.
   are built directly from committed active slots so boxes, classes, confidences, and tracker IDs remain slot-aligned.
 - Video clip indexes are built from explicit sequence/frame metadata, never filename order; unknown object identities
   remain `None`, while known sequence-local identities are validated for per-frame uniqueness and category stability.
+- Sequence augmentation replays one transform state across every chronological frame, and collation remains time-major
+  as one ordinary `NestedTensor` batch per step so the existing backbone can be reused unchanged during unroll.
 
 ---
 
@@ -184,4 +186,21 @@ after each iteration and it's included in prompts for context.
   - The focused suite passes through a dependency-isolated package harness (9 tests). Ordinary project collection is
     blocked first by the incompatible host Transformers package and, with package isolation, by missing `supervision`.
     Python compilation, Ruff lint/format, and `git diff --check` pass.
+---
+
+## 2026-07-27 - US-010
+- Added a shared sequence-transform adapter that replays Python, NumPy, PyTorch, and transform-owned random state across
+  every frame while advancing ambient randomness as a single augmentation draw.
+- Added chronological, time-major sequence collation with ordinary per-step `NestedTensor` batches, aligned targets,
+  backbone block-size padding, validation, and a picklable DataLoader factory.
+- Files changed: `src/rfdetr/datasets/video.py`, `src/rfdetr/datasets/__init__.py`,
+  `tests/datasets/test_video.py`, `.ralph-tui/progress.md`.
+- **Learnings:**
+  - Replaying only process-global generators is insufficient for Albumentations-style transforms that own private RNGs;
+    cloning the pre-call transform state makes those decisions shared while the live pipeline advances once per clip.
+  - Time-major collation provides a small interface over the existing image collator: each recurrent step still receives
+    the same padded `[batch, C, H, W]` contract and its targets remain in matching batch order.
+  - Ordinary pytest collection remains blocked by the host Transformers package lacking `BackboneConfigMixin`, and `uv`
+    cannot use its read-only cache. Dependency-isolated behavioral checks, Python compilation, Ruff lint/format, and
+    `git diff --check` pass.
 ---

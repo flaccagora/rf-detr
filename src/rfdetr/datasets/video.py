@@ -13,9 +13,19 @@ position.
 from __future__ import annotations
 
 import math
+import random
 from collections import defaultdict
+from collections.abc import Callable
+from copy import deepcopy
 from dataclasses import dataclass
+from functools import partial
 from typing import Any, Hashable, Mapping, Sequence
+
+import numpy as np
+import torch
+from torch import Tensor
+
+from rfdetr.utilities.tensors import NestedTensor, nested_tensor_from_tensor_list
 
 
 @dataclass(frozen=True)
@@ -63,6 +73,136 @@ class VideoClip:
     def frame_indices(self) -> tuple[int, ...]:
         """Return explicit source-frame indices in chronological order."""
         return tuple(frame.frame_index for frame in self.frames)
+
+
+class SharedSequenceTransform:
+    """Apply an ordinary image transform with shared randomness across a clip.
+
+    The wrapped callable keeps the existing RF-DETR ``(image, target)``
+    interface. Python, NumPy, and PyTorch CPU random-generator states are
+    replayed for each frame, so spatial decisions remain identity-aligned. The
+    ambient generators advance exactly as they would for one transform call.
+
+    Args:
+        transform: Callable accepting and returning an ``(image, target)`` pair.
+    """
+
+    def __init__(self, transform: Callable[[Any, Any], tuple[Any, Any]]) -> None:
+        self.transform = transform
+
+    def __call__(
+        self,
+        images: Sequence[Any],
+        targets: Sequence[Any],
+    ) -> tuple[tuple[Any, ...], tuple[Any, ...]]:
+        """Transform one chronological clip with a single random draw stream.
+
+        Args:
+            images: Chronologically ordered clip images.
+            targets: Targets aligned one-to-one with ``images``.
+
+        Returns:
+            Transformed images and targets in their original chronological order.
+
+        Raises:
+            ValueError: If the clip is empty or images and targets are misaligned.
+        """
+        if len(images) != len(targets):
+            raise ValueError(f"sequence images and targets must align, got {len(images)} and {len(targets)}")
+        if not images:
+            raise ValueError("a transformed sequence must contain at least one frame")
+
+        python_state = random.getstate()
+        numpy_state = np.random.get_state()
+        torch_state = torch.random.get_rng_state()
+        outputs: list[tuple[Any, Any]] = []
+        post_transform_states: tuple[object, tuple[Any, ...], Tensor] | None = None
+        try:
+            transform_snapshot = deepcopy(self.transform)
+        except (TypeError, ValueError):
+            transform_snapshot = None
+        try:
+            for index, (image, target) in enumerate(zip(images, targets)):
+                if index > 0:
+                    random.setstate(python_state)
+                    np.random.set_state(numpy_state)
+                    torch.random.set_rng_state(torch_state)
+                transform = self.transform
+                if index > 0 and transform_snapshot is not None:
+                    transform = deepcopy(transform_snapshot)
+                outputs.append(transform(image, target))
+                if index == 0:
+                    post_transform_states = (random.getstate(), np.random.get_state(), torch.random.get_rng_state())
+        finally:
+            if post_transform_states is not None:
+                random.setstate(post_transform_states[0])
+                np.random.set_state(post_transform_states[1])
+                torch.random.set_rng_state(post_transform_states[2])
+            else:
+                random.setstate(python_state)
+                np.random.set_state(numpy_state)
+                torch.random.set_rng_state(torch_state)
+
+        transformed_images, transformed_targets = zip(*outputs)
+        return tuple(transformed_images), tuple(transformed_targets)
+
+
+def sequence_collate_fn(
+    batch: list[tuple[Sequence[Tensor], Sequence[Any]]],
+    block_size: int | None = None,
+) -> tuple[tuple[NestedTensor, ...], tuple[tuple[Any, ...], ...]]:
+    """Collate fixed-length clips into chronological per-frame image batches.
+
+    Each returned :class:`NestedTensor` has the ordinary ``[batch, C, H, W]``
+    shape expected by the current backbone. Training can therefore recurrently
+    unroll over the outer time dimension without flattening sequence order.
+
+    Args:
+        batch: Clip samples containing aligned image and target sequences.
+        block_size: Optional spatial padding multiple passed to ordinary image
+            collation for windowed-backbone compatibility.
+
+    Returns:
+        Time-major image batches and time-major aligned targets.
+
+    Raises:
+        ValueError: If the batch is empty, a clip is empty, or clip lengths and
+            per-clip image/target counts differ.
+    """
+    if not batch:
+        raise ValueError("cannot collate an empty sequence batch")
+    clip_length = len(batch[0][0])
+    if clip_length == 0:
+        raise ValueError("sequence clips must contain at least one frame")
+    for images, targets in batch:
+        if len(images) != len(targets):
+            raise ValueError(f"sequence images and targets must align, got {len(images)} and {len(targets)}")
+        if len(images) != clip_length:
+            raise ValueError("all sequence clips in a batch must have the same length")
+
+    frame_batches = tuple(
+        nested_tensor_from_tensor_list([images[time] for images, _ in batch], block_size=block_size)
+        for time in range(clip_length)
+    )
+    target_batches = tuple(tuple(targets[time] for _, targets in batch) for time in range(clip_length))
+    return frame_batches, target_batches
+
+
+def make_sequence_collate_fn(
+    block_size: int | None = None,
+) -> Callable[
+    [list[tuple[Sequence[Tensor], Sequence[Any]]]],
+    tuple[tuple[NestedTensor, ...], tuple[tuple[Any, ...], ...]],
+]:
+    """Build a picklable sequence collator with fixed spatial padding rules.
+
+    Args:
+        block_size: Optional spatial padding multiple for every time step.
+
+    Returns:
+        DataLoader-compatible chronological sequence collator.
+    """
+    return partial(sequence_collate_fn, block_size=block_size)
 
 
 def _required_alias(item: Mapping[str, Any], names: Sequence[str], context: str) -> Any:
