@@ -19,6 +19,8 @@ after each iteration and it's included in prompts for context.
   query composition; final decoder features and predicted boxes then form the aligned candidate state.
 - Host lifecycle updates are pure immutable transitions over an aligned slot table and committed neural state; weak
   continuations preserve trusted tensors, and terminated slots become discovery queries only on the following frame.
+- Public streaming inference keeps all recurrent neural and host state inside an independent session; output detections
+  are built directly from committed active slots so boxes, classes, confidences, and tracker IDs remain slot-aligned.
 
 ---
 
@@ -142,4 +144,23 @@ after each iteration and it's included in prompts for context.
   - The host Transformers installation still blocks ordinary package collection. The focused lifecycle tests pass
     through an isolated package-loading harness; Python compilation, Ruff lint/format, and `git diff --check` pass,
     while `mypy` and `pre-commit` are unavailable.
+---
+
+## 2026-07-27 - US-008
+- Added a public `TrackingSession` plus `RFDETR.create_tracking_session()` for independent single-stream eager-PyTorch
+  inference with `update()` and `reset()` operations.
+- Added predict-compatible single-frame preprocessing for paths/URLs, PIL images, NumPy arrays, and tensors; returned
+  visible `supervision.Detections` carry committed slot-aligned tracker IDs and lifecycle metadata.
+- Added read-only active/suspended track inspection, lifecycle event inspection, automatic or explicit frame indexing,
+  session-local ID reset, and clear rejection of optimized/export-style inference without explicit state I/O.
+- Files changed: `src/rfdetr/tracking/session.py`, `src/rfdetr/tracking/__init__.py`, `src/rfdetr/detr.py`,
+  `tests/models/test_tracking_session.py`, `.ralph-tui/progress.md`.
+- **Learnings:**
+  - Session results should be projected from committed active lifecycle slots instead of generic top-k postprocessing;
+    this guarantees each public tracker ID refers to the same fixed query slot as its box, class, and confidence.
+  - Lazy model device placement must occur before allocating empty recurrent state, and normalized input tensors must be
+    cast to the model/state dtype before the tracking forward path for half-precision eager inference.
+  - The focused session suite passes through the isolated dependency-shim harness (6 tests). Ordinary host collection
+    remains blocked by incompatible/missing `transformers`, `deprecate`, and `supervision` packages. Python compilation,
+    Ruff lint/format, and `git diff --check` pass; `mypy` and `pre-commit` are unavailable.
 ---

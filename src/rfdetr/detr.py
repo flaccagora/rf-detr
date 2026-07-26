@@ -30,7 +30,7 @@ from PIL import Image
 
 from rfdetr.assets.coco_classes import COCO_CLASS_NAMES, COCO_CLASSES
 from rfdetr.assets.model_weights import download_pretrain_weights, get_model_cache_dir
-from rfdetr.config import ModelConfig, TrainConfig
+from rfdetr.config import ModelConfig, TrackingSessionConfig, TrainConfig
 from rfdetr.datasets._keypoint_schema import (
     active_keypoint_counts,
     infer_coco_keypoint_schema,
@@ -45,6 +45,8 @@ from rfdetr.utilities.logger import get_logger
 
 if TYPE_CHECKING:
     from supervision import Detections, KeyPoints
+
+    from rfdetr.tracking import TrackingSession
 
 try:
     torch.set_float32_matmul_precision("high")
@@ -1753,6 +1755,19 @@ class RFDETR:
             ModelContext with model, postprocess, device, resolution, args, and class_names attributes.
         """
         return _build_model_context(config)
+
+    def create_tracking_session(self, config: TrackingSessionConfig | None = None) -> TrackingSession:
+        """Create independent recurrent state for one logical video stream.
+
+        Args:
+            config: Optional lifecycle thresholds and expiry policy.
+
+        Returns:
+            A new empty single-stream tracking session.
+        """
+        from rfdetr.tracking import TrackingSession
+
+        return TrackingSession(self, config)
 
     @property
     def class_names(self) -> list[str]:
