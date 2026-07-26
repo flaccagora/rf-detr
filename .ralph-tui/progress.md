@@ -17,6 +17,8 @@ after each iteration and it's included in prompts for context.
   normalized boxes cross the parameterization boundary before selection, while inactive slots remain untouched.
 - Tracking forward paths should delegate to the ordinary detection graph and inject explicit state only at decoder
   query composition; final decoder features and predicted boxes then form the aligned candidate state.
+- Host lifecycle updates are pure immutable transitions over an aligned slot table and committed neural state; weak
+  continuations preserve trusted tensors, and terminated slots become discovery queries only on the following frame.
 
 ---
 
@@ -121,4 +123,23 @@ after each iteration and it's included in prompts for context.
   - Focused pytest collection remains blocked by the host Transformers package lacking `BackboneConfigMixin` and then
     the missing `deprecate` package. Python compilation, Ruff lint/format, and `git diff --check` pass; `mypy` and
     `pre-commit` are unavailable.
+---
+
+## 2026-07-27 - US-007
+- Added frozen host-side slot metadata, ordered lifecycle diagnostics, and a pure single-stream transition boundary for
+  activation, suspension, recovery, termination, duplicate suppression, capacity enforcement, and slot recycling.
+- Committed reliable candidate tensors while preserving the last trusted neural state during suspension; termination
+  clears both host and neural state, and monotonic IDs prevent recycled slots from inheriting old identities.
+- Added focused behavioral coverage for activation, elapsed-frame suspension, same-ID recovery, expiry and recycling,
+  overlap suppression, and strict host/neural role-map validation.
+- Files changed: `src/rfdetr/tracking/__init__.py`, `src/rfdetr/tracking/lifecycle.py`,
+  `tests/models/test_tracking_lifecycle.py`, `.ralph-tui/progress.md`.
+- **Learnings:**
+  - Lifecycle expiry should use source-frame deltas from the last reliable observation, rather than update-call counts,
+    so sampled or dropped frames age tracks deterministically.
+  - A slot terminated from a persistent role must remain cleared for the current transition and return as a discovery
+    query on the next model call; activating its current persistent candidate would cross role semantics.
+  - The host Transformers installation still blocks ordinary package collection. The focused lifecycle tests pass
+    through an isolated package-loading harness; Python compilation, Ruff lint/format, and `git diff --check` pass,
+    while `mypy` and `pre-commit` are unavailable.
 ---
