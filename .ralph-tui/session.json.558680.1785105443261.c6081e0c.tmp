@@ -3,10 +3,10 @@
   "sessionId": "9698fa22-85a0-42b8-bc8a-660d298fb847",
   "status": "running",
   "startedAt": "2026-07-26T22:30:55.552Z",
-  "updatedAt": "2026-07-26T22:34:12.052Z",
-  "currentIteration": 0,
+  "updatedAt": "2026-07-26T22:37:23.247Z",
+  "currentIteration": 1,
   "maxIterations": 1,
-  "tasksCompleted": 0,
+  "tasksCompleted": 1,
   "isPaused": false,
   "agentPlugin": "codex",
   "trackerState": {
@@ -24,8 +24,8 @@
       {
         "id": "US-002",
         "title": "Define neural state and frame-output contracts",
-        "status": "open",
-        "completedInSession": false
+        "status": "completed",
+        "completedInSession": true
       },
       {
         "id": "US-003",
@@ -113,7 +113,18 @@
       }
     ]
   },
-  "iterations": [],
+  "iterations": [
+    {
+      "iteration": 1,
+      "status": "completed",
+      "taskId": "US-002",
+      "taskTitle": "Define neural state and frame-output contracts",
+      "taskCompleted": true,
+      "durationMs": 193958,
+      "startedAt": "2026-07-26T22:30:58.089Z",
+      "endedAt": "2026-07-26T22:34:12.047Z"
+    }
+  ],
   "skippedTaskIds": [],
   "cwd": "/home/flaccagora/Desktop/clevis/submodules/rf-detr",
   "activeTaskIds": [],

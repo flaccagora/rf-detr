@@ -13,7 +13,11 @@ import torch
 
 from rfdetr.models.ops.functions import ms_deform_attn_core_pytorch
 from rfdetr.models.ops.modules.ms_deform_attn import MSDeformAttn
-from rfdetr.models.transformer import gen_encoder_output_proposals, gen_sineembed_for_position
+from rfdetr.models.transformer import (
+    gen_encoder_output_proposals,
+    gen_sineembed_for_position,
+    normalized_boxes_to_refpoints,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -24,6 +28,35 @@ def _reset_random_seeds() -> None:
 
 
 _MSDeformInputs = tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[tuple[int, int]]]
+
+
+@pytest.mark.parametrize(
+    ("bbox_reparam", "expected"),
+    [
+        pytest.param(
+            True,
+            torch.tensor([[[0.0, 0.25, 0.75, 1.0]]]),
+            id="direct-normalized-references",
+        ),
+        pytest.param(
+            False,
+            torch.logit(torch.tensor([[[1e-5, 0.25, 0.75, 1 - 1e-5]]])),
+            id="legacy-logit-references",
+        ),
+    ],
+)
+def test_normalized_boxes_to_refpoints_uses_decoder_parameterization(
+    bbox_reparam: bool,
+    expected: torch.Tensor,
+) -> None:
+    """Normalized recurrent boxes use the reference convention expected by the decoder."""
+    boxes = torch.tensor([[[0.0, 0.25, 0.75, 1.0]]])
+
+    actual = normalized_boxes_to_refpoints(boxes, bbox_reparam=bbox_reparam)
+
+    torch.testing.assert_close(actual, expected)
+    assert actual.dtype == boxes.dtype
+    assert actual.device == boxes.device
 
 
 def _build_ms_deform_inputs(

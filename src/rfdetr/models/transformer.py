@@ -24,13 +24,29 @@ from torch import Tensor, nn
 
 from rfdetr.models._types import BuilderArgs
 from rfdetr.models.heads.keypoints import ConditionalQueryInitializer
-from rfdetr.models.math import MLP
+from rfdetr.models.math import MLP, inverse_sigmoid
 from rfdetr.models.ops.modules import MSDeformAttn
 
 
 def _safe_multinormalize(dim: int) -> int:
     """Clamp a MultiheadAttention head count to at least one."""
     return max(1, dim)
+
+
+def normalized_boxes_to_refpoints(boxes: Tensor, *, bbox_reparam: bool) -> Tensor:
+    """Convert normalized ``cxcywh`` boxes to decoder reference parameters.
+
+    Args:
+        boxes: Normalized ``cxcywh`` boxes from a tracking-state boundary.
+        bbox_reparam: Whether the decoder uses direct normalized box references.
+
+    Returns:
+        Direct normalized references for reparameterized boxes, or finite
+        inverse-sigmoid references for the legacy additive parameterization.
+    """
+    if bbox_reparam:
+        return boxes
+    return inverse_sigmoid(boxes)
 
 
 def gen_sineembed_for_position(pos_tensor: Tensor, dim: int = 128) -> Tensor:

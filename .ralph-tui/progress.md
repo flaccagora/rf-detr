@@ -9,6 +9,8 @@ after each iteration and it's included in prompts for context.
   methods enforce cross-field capability constraints while leaving legacy defaults unchanged.
 - Neural tracking boundaries use frozen dataclasses that validate `[batch, query, ...]` slot alignment, normalized finite
   boxes, boolean role maps, and device/dtype compatibility at construction time.
+- Recurrent boxes cross into the decoder through `normalized_boxes_to_refpoints`: reparameterized models keep normalized
+  `cxcywh`, while legacy additive models receive numerically stable inverse-sigmoid references.
 
 ---
 
@@ -45,4 +47,19 @@ after each iteration and it's included in prompts for context.
   - Local pytest collection remains blocked before the focused tests by the host Transformers package lacking
     `BackboneConfigMixin`. Isolated runtime contract checks, Python compilation, Ruff lint/format, and
     `git diff --check` pass; `pre-commit` is unavailable.
+---
+
+## 2026-07-27 - US-003
+- Added one normalized-box-to-decoder-reference boundary supporting both RF-DETR box parameterizations.
+- Added focused behavioral coverage for direct normalized references, stable legacy inverse-sigmoid references, and
+  dtype/device preservation.
+- Files changed: `src/rfdetr/models/transformer.py`, `tests/models/test_transformer.py`,
+  `.ralph-tui/progress.md`.
+- **Learnings:**
+  - `bbox_reparam=True` uses normalized `cxcywh` references directly; the legacy additive refinement path expects
+    inverse-sigmoid references because decoder attention applies `sigmoid()` before using them.
+  - Reusing the existing `inverse_sigmoid` utility keeps exact zero/one state boxes finite at the conversion boundary.
+  - Focused pytest collection remains blocked by the host Transformers package lacking `BackboneConfigMixin`.
+    Isolated runtime conversion checks, Python compilation, Ruff lint/format, and `git diff --check` pass;
+    `pre-commit` is unavailable.
 ---
