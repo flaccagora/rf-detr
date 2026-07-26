@@ -47,6 +47,7 @@ from rfdetr.models.heads.segmentation import SegmentationHead
 from rfdetr.models.matcher import build_matcher
 from rfdetr.models.math import MLP
 from rfdetr.models.postprocess import PostProcess
+from rfdetr.models.tracking import TrackingFrameOutput, TrackQueryState
 from rfdetr.models.transformer import build_transformer
 from rfdetr.utilities.logger import get_logger
 from rfdetr.utilities.tensors import NestedTensor, nested_tensor_from_tensor_list
@@ -466,6 +467,16 @@ class LWDETR(nn.Module):
            - "aux_outputs": Optional, only returned when auxiliary losses are activated. It is a list of
                             dictionaries containing the two above keys for each decoder layer.
         """
+        return self._forward(samples, targets=targets)
+
+    def _forward(
+        self,
+        samples: NestedTensor,
+        targets=None,
+        *,
+        prior_state: TrackQueryState | None = None,
+    ) -> dict:
+        """Run the shared detection graph with an optional recurrent query state."""
         if isinstance(samples, (list, torch.Tensor)):
             samples = nested_tensor_from_tensor_list(samples)
         features, poss, cross_attn_features = self.backbone(samples)
@@ -496,14 +507,25 @@ class LWDETR(nn.Module):
                 cross_src, _ = feature.decompose()
                 cross_attn_srcs.append(cross_src)
 
-        transformer_outputs = self.transformer(
-            srcs,
-            masks,
-            poss,
-            refpoint_embed_weight,
-            query_feat_weight,
-            cross_attn_srcs=cross_attn_srcs,
-        )
+        if prior_state is None:
+            transformer_outputs = self.transformer(
+                srcs,
+                masks,
+                poss,
+                refpoint_embed_weight,
+                query_feat_weight,
+                cross_attn_srcs=cross_attn_srcs,
+            )
+        else:
+            transformer_outputs = self.transformer(
+                srcs,
+                masks,
+                poss,
+                refpoint_embed_weight,
+                query_feat_weight,
+                cross_attn_srcs=cross_attn_srcs,
+                prior_state=prior_state,
+            )
         if self.use_grouppose_keypoints:
             hs, ref_unsigmoid, hs_enc, ref_enc, keypoint_hs, enc_kp_predictions, _ = transformer_outputs
         else:
@@ -605,7 +627,56 @@ class LWDETR(nn.Module):
                 if keypoints_enc is not None:
                     out["pred_keypoints"] = keypoints_enc
 
+        if prior_state is not None:
+            if hs is None:
+                raise RuntimeError("Tracking forward requires at least one decoder layer.")
+            out["_tracking_query_features"] = hs[-1]
+
         return out
+
+    def forward_tracking(
+        self,
+        samples: NestedTensor | list[torch.Tensor] | torch.Tensor,
+        prior_state: TrackQueryState | None = None,
+    ) -> TrackingFrameOutput:
+        """Run one frame with explicit fixed-slot neural tracking state.
+
+        Args:
+            samples: Batched frame tensors or an existing nested tensor.
+            prior_state: Validated recurrent state. ``None`` means every query
+                slot uses normal current-frame discovery initialization.
+
+        Returns:
+            Standard detections plus aligned candidate state and input roles.
+        """
+        if isinstance(samples, (list, torch.Tensor)):
+            samples = nested_tensor_from_tensor_list(samples)
+
+        batch_size = samples.tensors.shape[0]
+        if prior_state is None:
+            prior_state = TrackQueryState.empty(
+                batch_size=batch_size,
+                num_queries=self.num_queries,
+                hidden_dim=self.transformer.d_model,
+                device=samples.tensors.device,
+                dtype=samples.tensors.dtype,
+            )
+
+        output = self._forward(samples, prior_state=prior_state)
+        candidate_state = TrackQueryState(
+            query_features=output.pop("_tracking_query_features"),
+            reference_boxes=output["pred_boxes"],
+            active_mask=torch.ones_like(prior_state.active_mask),
+        )
+        aux_outputs = tuple(output.get("aux_outputs", ()))
+        return TrackingFrameOutput(
+            pred_logits=output["pred_logits"],
+            pred_boxes=output["pred_boxes"],
+            candidate_state=candidate_state,
+            input_active_mask=prior_state.active_mask,
+            aux_outputs=aux_outputs,
+            enc_outputs=output.get("enc_outputs"),
+        )
 
     def forward_export(self, tensors):
         srcs, _, poss, cross_attn_srcs = self.backbone(tensors)

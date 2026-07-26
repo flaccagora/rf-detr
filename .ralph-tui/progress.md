@@ -15,6 +15,8 @@ after each iteration and it's included in prompts for context.
   bundle containing detached decoder references plus differentiable query features and encoder-loss boxes.
 - Persistent/discovery query composition is a fixed-shape `torch.where` selection over a per-item active mask; prior
   normalized boxes cross the parameterization boundary before selection, while inactive slots remain untouched.
+- Tracking forward paths should delegate to the ordinary detection graph and inject explicit state only at decoder
+  query composition; final decoder features and predicted boxes then form the aligned candidate state.
 
 ---
 
@@ -100,4 +102,23 @@ after each iteration and it's included in prompts for context.
   - Focused pytest collection remains blocked by the incompatible host Transformers package and then missing
     `supervision`, even with narrow compatibility shims. Isolated runtime checks pass in both box modes, as do Python
     compilation, Ruff lint/format, and `git diff --check`; `mypy` and `pre-commit` are unavailable.
+---
+
+## 2026-07-27 - US-006
+- Added `LWDETR.forward_tracking`, accepting explicit or omitted prior state and returning standard frame predictions,
+  aligned final-decoder candidate state, input slot roles, auxiliary predictions, and encoder predictions.
+- Routed recurrent state through the unchanged backbone, decoder, and detection heads while preserving the ordinary
+  `forward()` interface and stateless transformer call.
+- Added focused behavioral coverage for structured candidate output, role preservation, auxiliary/encoder output, and
+  empty-state parity with stateless evaluation.
+- Files changed: `src/rfdetr/models/lwdetr.py`, `src/rfdetr/models/transformer.py`,
+  `tests/models/test_lwdetr_tracking.py`, `.ralph-tui/progress.md`.
+- **Learnings:**
+  - The final decoder hidden state is already slot-aligned with final detection boxes, so it can become candidate neural
+    state without a second decoder path or lifecycle decisions inside the model.
+  - Keeping the input active mask separate from an all-candidate output state preserves the distinction between query
+    roles entering the frame and candidates that the external lifecycle may commit.
+  - Focused pytest collection remains blocked by the host Transformers package lacking `BackboneConfigMixin` and then
+    the missing `deprecate` package. Python compilation, Ruff lint/format, and `git diff --check` pass; `mypy` and
+    `pre-commit` are unavailable.
 ---

@@ -417,7 +417,22 @@ class Transformer(nn.Module):
         refpoint_embed: Tensor,
         query_feat: Tensor,
         cross_attn_srcs: Sequence[Tensor | nn.Module] | None = None,
+        prior_state: TrackQueryState | None = None,
     ) -> tuple[Tensor | None, ...]:
+        """Run the image transformer, optionally composing aligned recurrent queries.
+
+        Args:
+            srcs: Multi-level image features.
+            masks: Optional padding masks aligned with ``srcs``.
+            pos_embeds: Positional embeddings aligned with ``srcs``.
+            refpoint_embed: Learned decoder reference embeddings.
+            query_feat: Learned decoder query features.
+            cross_attn_srcs: Optional alternate keypoint cross-attention features.
+            prior_state: Optional fixed-slot tracking state.
+
+        Returns:
+            Decoder and encoder tensors in the established image-forward layout.
+        """
         src_flatten = []
         mask_flatten = [] if masks is not None else None
         lvl_pos_embed_flatten = []
@@ -514,6 +529,15 @@ class Transformer(nn.Module):
                     refpoint_embed_ts_subset = refpoint_embed_ts_subset + refpoint_embed_ts
 
                 refpoint_embed = torch.concat([refpoint_embed_ts_subset, refpoint_embed_subset], dim=-2)
+
+            if prior_state is not None:
+                tracking_initialization = self._compose_tracking_queries(
+                    tgt,
+                    refpoint_embed,
+                    prior_state,
+                )
+                tgt = tracking_initialization.query_features
+                refpoint_embed = tracking_initialization.decoder_refpoints
 
             # Insert register tokens per group
             original_num_queries_per_group = None
