@@ -25,6 +25,8 @@ after each iteration and it's included in prompts for context.
   remain `None`, while known sequence-local identities are validated for per-frame uniqueness and category stability.
 - Sequence augmentation replays one transform state across every chronological frame, and collation remains time-major
   as one ordinary `NestedTensor` batch per step so the existing backbone can be reused unchanged during unroll.
+- Sequence assignment first binds visible known identities to their persistent slots, then runs the ordinary Hungarian
+  matcher on the residual target/discovery-slot subproblem; unknown identities remain non-persistent.
 
 ---
 
@@ -202,5 +204,23 @@ after each iteration and it's included in prompts for context.
     the same padded `[batch, C, H, W]` contract and its targets remain in matching batch order.
   - Ordinary pytest collection remains blocked by the host Transformers package lacking `BackboneConfigMixin`, and `uv`
     cannot use its read-only cache. Dependency-isolated behavioral checks, Python compilation, Ruff lint/format, and
+    `git diff --check` pass.
+---
+
+## 2026-07-27 - US-011
+- Added immutable per-frame sequence assignment results that separate fixed continuing correspondences, residual
+  discovery matches, absent persistent slots, and the updated slot identity table.
+- Bound visible continuing IDs directly to prior query positions and restricted ordinary Hungarian matching to
+  identity-free discovery slots plus targets not represented by any persistent slot.
+- Covered synthetic geometry crossings, absent continuations, newborn activation, uniqueness, and exclusion of
+  continuing targets from discovery matching.
+- Files changed: `src/rfdetr/models/matcher.py`, `tests/models/test_matcher.py`, `.ralph-tui/progress.md`.
+- **Learnings:**
+  - Residual matching can reuse all existing RF-DETR cost terms by slicing query- and instance-aligned tensors before
+    invoking the ordinary matcher, keeping identity policy independent from detection costs.
+  - Unknown target identities may receive per-frame discovery supervision but must remain `None` in the next slot table
+    so missing identity knowledge is never synthesized into a temporal correspondence.
+  - Ordinary pytest collection remains blocked by the host Transformers package lacking `BackboneConfigMixin`, and `uv`
+    cannot use its read-only cache. Dependency-isolated assignment checks, Python compilation, Ruff lint/format, and
     `git diff --check` pass.
 ---

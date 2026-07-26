@@ -19,6 +19,9 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from typing import Any, Sequence
+
 import numpy as np
 import torch
 import torch.nn.functional as F  # noqa: N812
@@ -33,6 +36,163 @@ from rfdetr.utilities.logger import get_logger
 logger = get_logger()
 _SANITIZED_COST_MARGIN = 1.0
 _FOCAL_LOSS_GAMMA = 2.0
+
+
+@dataclass(frozen=True)
+class SequenceAssignment:
+    """One frame's fixed-identity and discovery decoder assignments.
+
+    Args:
+        continuing_indices: Global query and target indices for identities
+            already represented by persistent slots.
+        discovery_indices: Global query and target indices selected by
+            Hungarian matching over discovery slots and residual targets.
+        absent_query_indices: Persistent query slots whose identities are not
+            visible in the current frame.
+        slot_track_ids: Identity table after binding matched newborn identities.
+            Unknown identities remain ``None`` and therefore cannot accidentally
+            become continuing correspondences on a later frame.
+    """
+
+    continuing_indices: tuple[torch.Tensor, torch.Tensor]
+    discovery_indices: tuple[torch.Tensor, torch.Tensor]
+    absent_query_indices: torch.Tensor
+    slot_track_ids: tuple[int | None, ...]
+
+    @property
+    def decoder_indices(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return all decoder matches in criterion-compatible form."""
+        return (
+            torch.cat((self.continuing_indices[0], self.discovery_indices[0])),
+            torch.cat((self.continuing_indices[1], self.discovery_indices[1])),
+        )
+
+
+def _target_track_ids(target: dict[str, Any]) -> tuple[int | None, ...]:
+    """Normalize one target's explicit identity vector."""
+    if "track_ids" not in target:
+        raise ValueError("sequence targets require explicit 'track_ids'")
+    raw_ids = target["track_ids"]
+    values = raw_ids.tolist() if isinstance(raw_ids, torch.Tensor) else list(raw_ids)
+    if len(values) != len(target["labels"]):
+        raise ValueError("target track_ids must align with labels and boxes")
+
+    track_ids: list[int | None] = []
+    for value in values:
+        if value is None or value == -1:
+            track_ids.append(None)
+        elif isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError("target track_ids must contain non-negative integers, None, or -1")
+        else:
+            track_ids.append(value)
+    known_ids = [track_id for track_id in track_ids if track_id is not None]
+    if len(known_ids) != len(set(known_ids)):
+        raise ValueError("known target track_ids must be unique within a frame")
+    return tuple(track_ids)
+
+
+def _select_queries(outputs: dict[str, Any], batch_index: int, query_indices: torch.Tensor) -> dict[str, Any]:
+    """Select one batch item's discovery-query outputs for residual matching."""
+    selected: dict[str, Any] = {}
+    for name, value in outputs.items():
+        if isinstance(value, torch.Tensor) and value.ndim >= 2 and value.shape[:2] == outputs["pred_logits"].shape[:2]:
+            selected[name] = value[batch_index : batch_index + 1, query_indices]
+    return selected
+
+
+def _select_targets(target: dict[str, Any], target_indices: torch.Tensor) -> dict[str, Any]:
+    """Select instance-aligned fields needed by the ordinary matcher."""
+    num_targets = len(target["labels"])
+    return {
+        name: value[target_indices]
+        for name, value in target.items()
+        if isinstance(value, torch.Tensor) and value.ndim > 0 and len(value) == num_targets
+    }
+
+
+@torch.no_grad()
+def identity_aware_sequence_assignment(
+    matcher: HungarianMatcher,
+    outputs: dict[str, Any],
+    targets: list[dict[str, Any]],
+    slot_track_ids: Sequence[Sequence[int | None]],
+) -> list[SequenceAssignment]:
+    """Assign one sequence frame without allowing persistent identities to swap.
+
+    Continuing visible identities are bound directly to their prior slots.
+    Hungarian matching then sees only identity-free discovery slots and targets
+    not represented by any persistent slot.
+
+    Args:
+        matcher: Existing detection matcher used for residual discovery.
+        outputs: Current decoder predictions.
+        targets: Per-item targets with aligned ``labels``, ``boxes``, and
+            explicit ``track_ids``. ``None`` or tensor value ``-1`` denotes an
+            unknown identity.
+        slot_track_ids: Per-item fixed query-slot identity tables. ``None``
+            marks a discovery slot.
+
+    Returns:
+        One immutable assignment result per batch item.
+
+    Raises:
+        ValueError: If batch, slot, or identity metadata is inconsistent.
+    """
+    batch_size, num_queries = outputs["pred_logits"].shape[:2]
+    if len(targets) != batch_size or len(slot_track_ids) != batch_size:
+        raise ValueError("outputs, targets, and slot_track_ids must have the same batch size")
+
+    assignments: list[SequenceAssignment] = []
+    for batch_index, (target, prior_ids_raw) in enumerate(zip(targets, slot_track_ids)):
+        prior_ids = tuple(prior_ids_raw)
+        if len(prior_ids) != num_queries:
+            raise ValueError("every slot identity table must align with decoder queries")
+        known_prior_ids = [track_id for track_id in prior_ids if track_id is not None]
+        if len(known_prior_ids) != len(set(known_prior_ids)):
+            raise ValueError("persistent slot track IDs must be unique")
+
+        target_ids = _target_track_ids(target)
+        target_by_id = {track_id: index for index, track_id in enumerate(target_ids) if track_id is not None}
+        continuing_queries = [query_index for query_index, track_id in enumerate(prior_ids) if track_id in target_by_id]
+        continuing_targets = [target_by_id[prior_ids[query_index]] for query_index in continuing_queries]
+        absent_queries = [
+            query_index
+            for query_index, track_id in enumerate(prior_ids)
+            if track_id is not None and track_id not in target_by_id
+        ]
+        represented_ids = set(known_prior_ids)
+        residual_targets = [
+            index for index, track_id in enumerate(target_ids) if track_id is None or track_id not in represented_ids
+        ]
+        discovery_queries = [index for index, track_id in enumerate(prior_ids) if track_id is None]
+
+        query_tensor = torch.as_tensor(discovery_queries, dtype=torch.int64)
+        target_tensor = torch.as_tensor(residual_targets, dtype=torch.int64)
+        if discovery_queries and residual_targets:
+            residual_outputs = _select_queries(outputs, batch_index, query_tensor)
+            residual_target = _select_targets(target, target_tensor)
+            local_queries, local_targets = matcher(residual_outputs, [residual_target])[0]
+            matched_queries = query_tensor[local_queries]
+            matched_targets = target_tensor[local_targets]
+        else:
+            matched_queries = torch.empty(0, dtype=torch.int64)
+            matched_targets = torch.empty(0, dtype=torch.int64)
+
+        next_ids = list(prior_ids)
+        for query_index, target_index in zip(matched_queries.tolist(), matched_targets.tolist()):
+            next_ids[query_index] = target_ids[target_index]
+        assignments.append(
+            SequenceAssignment(
+                continuing_indices=(
+                    torch.as_tensor(continuing_queries, dtype=torch.int64),
+                    torch.as_tensor(continuing_targets, dtype=torch.int64),
+                ),
+                discovery_indices=(matched_queries, matched_targets),
+                absent_query_indices=torch.as_tensor(absent_queries, dtype=torch.int64),
+                slot_track_ids=tuple(next_ids),
+            )
+        )
+    return assignments
 
 
 class HungarianMatcher(nn.Module):

@@ -8,7 +8,7 @@ import pytest
 import torch
 
 from rfdetr.models import matcher as matcher_module
-from rfdetr.models.matcher import HungarianMatcher
+from rfdetr.models.matcher import HungarianMatcher, identity_aware_sequence_assignment
 
 
 @pytest.fixture()
@@ -24,6 +24,81 @@ def standard_target() -> dict[str, torch.Tensor]:
         "labels": torch.tensor([0], dtype=torch.int64),
         "boxes": torch.tensor([[0.5, 0.5, 0.2, 0.2]], dtype=torch.float32),
     }
+
+
+def test_sequence_assignment_keeps_crossing_identities_in_prior_slots() -> None:
+    """Continuing identities stay fixed even when instantaneous geometry favors a swap."""
+    matcher = HungarianMatcher(cost_class=0, cost_bbox=1, cost_giou=0)
+    outputs = {
+        "pred_logits": torch.zeros(1, 3, 1),
+        "pred_boxes": torch.tensor(
+            [
+                [
+                    [0.8, 0.5, 0.1, 0.1],
+                    [0.2, 0.5, 0.1, 0.1],
+                    [0.5, 0.5, 0.1, 0.1],
+                ]
+            ]
+        ),
+    }
+    targets = [
+        {
+            "labels": torch.tensor([0, 0]),
+            "boxes": torch.tensor([[0.2, 0.5, 0.1, 0.1], [0.8, 0.5, 0.1, 0.1]]),
+            "track_ids": torch.tensor([10, 20]),
+        }
+    ]
+
+    assignments = identity_aware_sequence_assignment(
+        matcher,
+        outputs,
+        targets,
+        slot_track_ids=[(10, 20, None)],
+    )
+
+    assert assignments[0].continuing_indices[0].tolist() == [0, 1]
+    assert assignments[0].continuing_indices[1].tolist() == [0, 1]
+    assert assignments[0].decoder_indices[0].tolist() == [0, 1]
+
+
+def test_sequence_assignment_matches_only_newborn_targets_to_discovery_slots() -> None:
+    """Absent slots stay reserved and continuing targets never enter residual matching."""
+    matcher = HungarianMatcher(cost_class=0, cost_bbox=1, cost_giou=0)
+    outputs = {
+        "pred_logits": torch.zeros(1, 4, 1),
+        "pred_boxes": torch.tensor(
+            [
+                [
+                    [0.9, 0.5, 0.1, 0.1],
+                    [0.1, 0.5, 0.1, 0.1],
+                    [0.3, 0.5, 0.1, 0.1],
+                    [0.7, 0.5, 0.1, 0.1],
+                ]
+            ]
+        ),
+    }
+    targets = [
+        {
+            "labels": torch.tensor([0, 0]),
+            "boxes": torch.tensor([[0.1, 0.5, 0.1, 0.1], [0.7, 0.5, 0.1, 0.1]]),
+            "track_ids": torch.tensor([10, 30]),
+        }
+    ]
+
+    assignment = identity_aware_sequence_assignment(
+        matcher,
+        outputs,
+        targets,
+        slot_track_ids=[(10, 20, None, None)],
+    )[0]
+
+    assert assignment.continuing_indices[0].tolist() == [0]
+    assert assignment.discovery_indices[0].tolist() == [3]
+    assert assignment.discovery_indices[1].tolist() == [1]
+    assert assignment.absent_query_indices.tolist() == [1]
+    assert assignment.slot_track_ids == (10, 20, None, 30)
+    assert len(set(assignment.decoder_indices[0].tolist())) == 2
+    assert len(set(assignment.decoder_indices[1].tolist())) == 2
 
 
 class TestHungarianMatcherNonFiniteCosts:
