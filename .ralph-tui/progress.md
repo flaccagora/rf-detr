@@ -17,6 +17,8 @@ after each iteration and it's included in prompts for context.
   normalized boxes cross the parameterization boundary before selection, while inactive slots remain untouched.
 - Tracking forward paths should delegate to the ordinary detection graph and inject explicit state only at decoder
   query composition; final decoder features and predicted boxes then form the aligned candidate state.
+- Tracking remains checkpoint-compatible by keeping recurrence parameter-free: image and tracking paths share one
+  strict state dict, and ordinary stateless `forward()` remains the image-inference boundary.
 - Host lifecycle updates are pure immutable transitions over an aligned slot table and committed neural state; weak
   continuations preserve trusted tensors, and terminated slots become discovery queries only on the following frame.
 - Public streaming inference keeps all recurrent neural and host state inside an independent session; output detections
@@ -266,4 +268,20 @@ after each iteration and it's included in prompts for context.
     `deprecate` is absent, and the training environment lacks `pytorch_lightning`; the checked-in `.venv` also lacks
     pytest. Python compilation, Ruff lint/format, and `git diff --check` pass; `pre-commit` and typecheck tools are not
     installed.
+---
+
+## 2026-07-27 - US-014
+- Verified that recurrent tracking introduces no checkpoint-only parameters: existing detection state dicts load
+  strictly into the tracking path, and tracking state dicts load strictly back into ordinary image inference.
+- Added a regression test that round-trips weights in both directions and confirms stateless image predictions match
+  empty-state tracking predictions.
+- Files changed: `tests/models/test_lwdetr_tracking.py`, `.ralph-tui/progress.md`.
+- **Learnings:**
+  - Checkpoint compatibility follows from keeping recurrent tensors explicit runtime inputs and candidate outputs,
+    rather than learned model members; detection and tracking therefore retain one identical parameter namespace.
+  - Image compatibility is preserved by leaving `LWDETR.forward()` stateless while `forward_tracking()` delegates to
+    the same detection graph with an explicit empty state.
+  - Focused pytest collection remains blocked by the host Transformers package lacking `BackboneConfigMixin`, even
+    with a writable isolated uv cache. Python compilation, Ruff lint/format, and `git diff --check` pass;
+    `pre-commit` and `mypy` are unavailable.
 ---

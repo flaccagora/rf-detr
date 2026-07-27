@@ -5,6 +5,7 @@
 # ------------------------------------------------------------------------
 """Behavioral tests for the low-level LWDETR tracking forward path."""
 
+import copy
 from unittest.mock import MagicMock
 
 import torch
@@ -91,3 +92,25 @@ def test_empty_tracking_state_matches_stateless_evaluation_predictions() -> None
     supplied_state = transformer.call_args.kwargs["prior_state"]
     assert isinstance(supplied_state, TrackQueryState)
     assert not supplied_state.active_mask.any()
+
+
+def test_detection_and_tracking_checkpoints_share_one_strict_state_dict() -> None:
+    """Current image weights initialize tracking, and tracking weights retain image prediction."""
+    image_model, _ = _make_tracking_model()
+    tracking_model, _ = _make_tracking_model()
+    image_model.eval()
+    tracking_model.eval()
+    samples = torch.ones(2, 3, 8, 8)
+
+    detection_checkpoint = copy.deepcopy(image_model.state_dict())
+    tracking_model.load_state_dict(detection_checkpoint, strict=True)
+    tracking_output = tracking_model.forward_tracking(samples)
+
+    tracking_checkpoint = copy.deepcopy(tracking_model.state_dict())
+    reloaded_image_model, _ = _make_tracking_model()
+    reloaded_image_model.eval()
+    reloaded_image_model.load_state_dict(tracking_checkpoint, strict=True)
+    image_output = reloaded_image_model(samples)
+
+    torch.testing.assert_close(image_output["pred_logits"], tracking_output.pred_logits)
+    torch.testing.assert_close(image_output["pred_boxes"], tracking_output.pred_boxes)
