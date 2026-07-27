@@ -23,6 +23,7 @@ from rfdetr.datasets.video import (
     SharedSequenceTransform,
     VideoSequenceDataset,
     build_video_clip_index,
+    build_video_validation_clip_index,
     sequence_collate_fn,
 )
 
@@ -153,6 +154,28 @@ def test_clip_index_uses_sliding_windows_without_crossing_sequences() -> None:
     clips = build_video_clip_index(data, clip_length=2, stride=1)
 
     assert [clip.image_ids for clip in clips] == [(10, 11), (11, 12), (31, 30)]
+
+
+def test_validation_clip_index_defaults_to_non_overlapping_frames() -> None:
+    """Validation defaults must score each complete source frame at most once."""
+    data = _annotations()
+    data["images"].insert(
+        2,
+        {
+            "id": 12,
+            "file_name": "ignored.png",
+            "width": 6,
+            "height": 4,
+            "sequence_id": "case-a",
+            "frame_index": 9,
+        },
+    )
+
+    clips = build_video_validation_clip_index(data, clip_length=2)
+
+    assert [clip.image_ids for clip in clips] == [(10, 11), (31, 30)]
+    evaluated_frames = [(clip.sequence_id, frame.frame_index) for clip in clips for frame in clip.frames]
+    assert len(evaluated_frames) == len(set(evaluated_frames))
 
 
 def test_video_dataset_loads_a_chronological_clip_with_aligned_targets(tmp_path: Path) -> None:

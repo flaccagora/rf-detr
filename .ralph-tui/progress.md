@@ -13,7 +13,40 @@ after each iteration and it's included in prompts for context.
   across frames, while allowing declared pixel-level transforms to draw independently.
 - Keep one complete clip behind each video-dataset index; ordinary DataLoader samplers, distributed sharding, batch
   sizing, and gradient-accumulation alignment then operate in clip units without temporal sampler special cases.
+- Give validation its own clip-index boundary: default its stride to the clip length so source frames are scored once,
+  while retaining duplicate `(sequence_id, frame_index)` rejection at the evaluation accumulator boundary.
 
+---
+
+## 2026-07-27 - US-005
+- Added a public validation clip-index boundary that defaults to complete, non-overlapping clips while leaving the
+  training sliding-window index unchanged.
+- Verified the existing sequence output keeps identity-free detection records available independently, records reset
+  boundaries on sequence changes, rejects duplicate source frames deterministically, and isolates MOT exports by
+  sequence. Ordinary image COCO evaluation code and behavior were not modified.
+- Added focused coverage proving the default validation index contains no repeated `(sequence_id, frame_index)` keys.
+- Files changed: `src/rfdetr/datasets/video.py`, `src/rfdetr/datasets/__init__.py`,
+  `tests/datasets/test_video.py`, `.ralph-tui/progress.md`.
+- Verification:
+  - `docker compose run --rm -v "$PWD/submodules/rf-detr:/app/submodules/rf-detr:ro" clevis -lc 'python -m pip
+    install -q pytest pytest-timeout pytest-doctestplus && cd /app/submodules/rf-detr && PYTHONPATH=src python -m
+    pytest -q tests/datasets/test_video.py tests/evaluation/test_sequence.py'` (from Clevis root) — blocked before
+    startup because Compose requires `HF_HOME`.
+  - `HF_HOME=/tmp/clevis-hf docker compose run --rm -v
+    "$PWD/submodules/rf-detr:/app/submodules/rf-detr:ro" clevis -lc 'python -m pip install -q pytest pytest-timeout
+    pytest-doctestplus && cd /app/submodules/rf-detr && PYTHONPATH=src python -m pytest -q
+    tests/datasets/test_video.py tests/evaluation/test_sequence.py'` (from Clevis root) — blocked because access to
+    `/var/run/docker.sock` was denied.
+  - `pre-commit run --all-files` — unavailable (`pre-commit: command not found`).
+  - Dependency-isolated sequence validation checks for non-overlap, detection-only records, reset boundaries, and
+    duplicate rejection — passed.
+  - `ruff check` and focused `ruff format --check` for the affected dataset/evaluation files, `python -m compileall`,
+    and `git diff --check` — passed.
+- **Learnings:**
+  - Training and evaluation need different default clip strides: sliding windows improve training coverage, but
+    validation must advance by a full clip unless its downstream accumulator explicitly handles repeated provenance.
+  - Using `(sequence_id, frame_index)` as the evaluated-frame key preserves sequence-local frame numbering and prevents
+    both cross-clip metric inflation and accidental identity merging across sequence resets.
 ---
 
 ## 2026-07-27 - US-004

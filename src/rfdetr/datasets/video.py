@@ -480,6 +480,32 @@ def build_video_clip_index(
     return tuple(clips)
 
 
+def build_video_validation_clip_index(
+    annotations: Mapping[str, Any],
+    clip_length: int,
+    stride: int | None = None,
+) -> tuple[VideoClip, ...]:
+    """Build deterministic validation clips without overlapping source frames by default.
+
+    Callers may explicitly request a different stride, for example when a
+    sequence evaluator deterministically rejects or removes repeated source
+    frames. The default keeps complete clips and advances by ``clip_length``,
+    so every represented ``(sequence_id, frame_index)`` is scored once.
+
+    Args:
+        annotations: Mapping containing COCO-style ``images`` and
+            ``annotations`` arrays.
+        clip_length: Number of frames in every returned clip.
+        stride: Optional distance between adjacent clip starts. ``None`` uses
+            ``clip_length`` to produce non-overlapping validation clips.
+
+    Returns:
+        Frozen validation clips grouped by sequence and sorted chronologically.
+    """
+    validation_stride = clip_length if stride is None else stride
+    return build_video_clip_index(annotations, clip_length=clip_length, stride=validation_stride)
+
+
 # Descriptive aliases for callers using COCO-video terminology.
 CocoVideoClip = VideoClip
 build_coco_video_clip_index = build_video_clip_index
