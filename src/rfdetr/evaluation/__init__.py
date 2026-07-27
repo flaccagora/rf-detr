@@ -10,9 +10,19 @@ from rfdetr.evaluation.keypoint_oks import (
     MetricKeypointOKS,
     OKSKey,
 )
+from rfdetr.evaluation.sequence import (
+    SequenceEvaluationOutput,
+    SequenceEvaluationRecord,
+    SequenceLifecycleDiagnostic,
+    SequencePrediction,
+)
 
 __all__ = [
     "DEFAULT_KEYPOINT_MAX_DETS",
     "OKSKey",
     "MetricKeypointOKS",
+    "SequenceEvaluationOutput",
+    "SequenceEvaluationRecord",
+    "SequenceLifecycleDiagnostic",
+    "SequencePrediction",
 ]

@@ -33,6 +33,8 @@ after each iteration and it's included in prompts for context.
   proposal losses remain frame-local and use the ordinary matcher, while unmatched absent slots are classification-only.
 - Recurrent Lightning steps consume time-major frame batches, create state per clip, average already-normalized frame
   losses, and commit predicted candidate tensors under assignment-guided or confidence-gated lifecycle policy.
+- Sequence evaluation retains one rich provenance record while deriving identity-free detection views and per-sequence
+  MOTChallenge streams; sequence grouping is the reset boundary that scopes otherwise reusable session-local track IDs.
 
 ---
 
@@ -284,4 +286,23 @@ after each iteration and it's included in prompts for context.
   - Focused pytest collection remains blocked by the host Transformers package lacking `BackboneConfigMixin`, even
     with a writable isolated uv cache. Python compilation, Ruff lint/format, and `git diff --check` pass;
     `pre-commit` and `mypy` are unavailable.
+---
+
+## 2026-07-27 - US-015
+- Added validated sequence prediction records containing explicit sequence, source frame, absolute box, class, score,
+  and sequence-local track identity.
+- Added an evaluation accumulator with explicit reset boundaries, identity-free per-frame detection records,
+  per-sequence TrackEval-compatible MOTChallenge export, and lifecycle/false-track diagnostics.
+- Files changed: `src/rfdetr/evaluation/sequence.py`, `src/rfdetr/evaluation/__init__.py`,
+  `tests/evaluation/test_sequence.py`, `.ralph-tui/progress.md`.
+- **Learnings:**
+  - Track IDs are session-local, so MOT export must produce a separate stream for every sequence instead of flattening
+    records into one namespace; equal numeric IDs after a reset are then unambiguous.
+  - Association identity can be removed from the same rich records to preserve ordinary frame-level detection scoring
+    without maintaining a second prediction path.
+  - False-track creation is evaluator-derived: an unmatched lifecycle birth is recorded separately from the host
+    lifecycle event, while recovery, suspension, termination, and duplicate suppression remain policy diagnostics.
+  - Ordinary pytest collection remains blocked by the host Transformers package lacking `BackboneConfigMixin`.
+    Dependency-isolated behavioral checks, Python compilation, Ruff lint/format, and `git diff --check` pass;
+    `pre-commit` and typecheck tools are unavailable.
 ---
