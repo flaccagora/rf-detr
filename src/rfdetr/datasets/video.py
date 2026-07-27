@@ -19,11 +19,14 @@ from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import dataclass
 from functools import partial
+from pathlib import Path
 from typing import Any, Hashable, Mapping, Sequence
 
 import numpy as np
 import torch
+from PIL import Image
 from torch import Tensor
+from torch.utils.data import Dataset
 
 from rfdetr.utilities.tensors import NestedTensor, nested_tensor_from_tensor_list
 
@@ -44,6 +47,7 @@ class VideoObject:
     category_id: int
     track_id: int | None
     identity_provenance: str
+    bbox: tuple[float, float, float, float]
 
 
 @dataclass(frozen=True)
@@ -51,6 +55,9 @@ class VideoFrame:
     """One explicitly positioned frame in a sequence."""
 
     image_id: int
+    file_name: str
+    width: int
+    height: int
     sequence_id: Hashable
     frame_index: int
     timestamp: float | None
@@ -75,13 +82,86 @@ class VideoClip:
         return tuple(frame.frame_index for frame in self.frames)
 
 
-class SharedSequenceTransform:
-    """Apply an ordinary image transform with shared randomness across a clip.
+class VideoSequenceDataset(Dataset[tuple[tuple[Any, ...], tuple[dict[str, Any], ...]]]):
+    """Load validated chronological clips by their explicit indexed paths.
 
-    The wrapped callable keeps the existing RF-DETR ``(image, target)``
-    interface. Python, NumPy, and PyTorch CPU random-generator states are
-    replayed for each frame, so spatial decisions remain identity-aligned. The
-    ambient generators advance exactly as they would for one transform call.
+    Args:
+        image_root: Directory relative to which indexed image paths are resolved.
+        clips: Output from :func:`build_video_clip_index`.
+        transform: Optional ordinary ``(image, target)`` transform. Its random
+            choices are shared across every frame in a clip.
+    """
+
+    def __init__(
+        self,
+        image_root: str | Path,
+        clips: Sequence[VideoClip],
+        transform: Callable[[Any, Any], tuple[Any, Any]] | None = None,
+    ) -> None:
+        self.image_root = Path(image_root)
+        self.clips = tuple(clips)
+        self.transform = SharedSequenceTransform(transform) if transform is not None else None
+
+    def __len__(self) -> int:
+        """Return the number of validated clips."""
+        return len(self.clips)
+
+    def __getitem__(self, index: int) -> tuple[tuple[Any, ...], tuple[dict[str, Any], ...]]:
+        """Load one clip and its one-to-one chronological targets."""
+        clip = self.clips[index]
+        images: list[Image.Image] = []
+        targets: list[dict[str, Any]] = []
+        for frame in clip.frames:
+            image_path = self.image_root / frame.file_name
+            if not image_path.is_file():
+                raise FileNotFoundError(
+                    f"image {frame.image_id} for sequence {frame.sequence_id!r}, frame {frame.frame_index} "
+                    f"does not exist at {image_path}"
+                )
+            with Image.open(image_path) as source:
+                image = source.convert("RGB")
+            if image.size != (frame.width, frame.height):
+                raise ValueError(
+                    f"image {frame.image_id} dimensions {image.size} do not match annotation "
+                    f"{(frame.width, frame.height)} at {image_path}"
+                )
+            images.append(image)
+            targets.append(
+                {
+                    "boxes": torch.tensor([obj.bbox for obj in frame.objects], dtype=torch.float32).reshape(-1, 4),
+                    "labels": torch.tensor([obj.category_id for obj in frame.objects], dtype=torch.int64),
+                    "track_ids": [obj.track_id for obj in frame.objects],
+                    "image_id": torch.tensor(frame.image_id, dtype=torch.int64),
+                    "orig_size": torch.tensor([frame.height, frame.width], dtype=torch.int64),
+                    "size": torch.tensor([frame.height, frame.width], dtype=torch.int64),
+                    "sequence_id": frame.sequence_id,
+                    "frame_index": frame.frame_index,
+                    "timestamp": frame.timestamp,
+                    "identity_provenance": tuple(obj.identity_provenance for obj in frame.objects),
+                }
+            )
+        image_sequence: tuple[Any, ...] = tuple(images)
+        target_sequence = tuple(targets)
+        if self.transform is not None:
+            image_sequence, target_sequence = self.transform(image_sequence, target_sequence)
+        return image_sequence, target_sequence
+
+
+class SharedSequenceTransform:
+    """Apply an ordinary detection transform coherently across a clip.
+
+    Standard composed RF-DETR pipelines are applied one stage at a time.
+    Geometric :class:`~rfdetr.datasets.transforms.AlbumentationsWrapper`
+    stages replay Python, NumPy, and PyTorch CPU randomness for every frame, so
+    resize, crop, and flip decisions remain trajectory-aligned. Pixel-level
+    stages are deliberately applied normally to each frame: blur, color, and
+    noise therefore remain frame-local photometric augmentation. Deterministic
+    conversion and normalization stages are also applied frame by frame.
+
+    A standalone callable, or a composed stage whose spatial behavior is not
+    declared, is conservatively treated as geometric and receives shared
+    randomness. The wrapped objects and ordinary image pipelines are not
+    modified.
 
     Args:
         transform: Callable accepting and returning an ``(image, target)`` pair.
@@ -95,7 +175,7 @@ class SharedSequenceTransform:
         images: Sequence[Any],
         targets: Sequence[Any],
     ) -> tuple[tuple[Any, ...], tuple[Any, ...]]:
-        """Transform one chronological clip with a single random draw stream.
+        """Transform one chronological clip with shared spatial random draws.
 
         Args:
             images: Chronologically ordered clip images.
@@ -112,25 +192,44 @@ class SharedSequenceTransform:
         if not images:
             raise ValueError("a transformed sequence must contain at least one frame")
 
+        outputs = list(zip(images, targets))
+        stages = getattr(self.transform, "transforms", None)
+        if not isinstance(stages, Sequence):
+            stages = (self.transform,)
+        for stage in stages:
+            if getattr(stage, "_is_geometric", None) is False:
+                outputs = [stage(image, target) for image, target in outputs]
+            else:
+                outputs = self._apply_shared(stage, outputs)
+
+        transformed_images, transformed_targets = zip(*outputs)
+        return tuple(transformed_images), tuple(transformed_targets)
+
+    @staticmethod
+    def _apply_shared(
+        transform: Callable[[Any, Any], tuple[Any, Any]],
+        inputs: Sequence[tuple[Any, Any]],
+    ) -> list[tuple[Any, Any]]:
+        """Apply one spatial stage using the same random draw stream."""
         python_state = random.getstate()
         numpy_state = np.random.get_state()
         torch_state = torch.random.get_rng_state()
         outputs: list[tuple[Any, Any]] = []
         post_transform_states: tuple[object, tuple[Any, ...], Tensor] | None = None
         try:
-            transform_snapshot = deepcopy(self.transform)
+            transform_snapshot = deepcopy(transform)
         except (TypeError, ValueError):
             transform_snapshot = None
         try:
-            for index, (image, target) in enumerate(zip(images, targets)):
+            for index, (image, target) in enumerate(inputs):
                 if index > 0:
                     random.setstate(python_state)
                     np.random.set_state(numpy_state)
                     torch.random.set_rng_state(torch_state)
-                transform = self.transform
+                frame_transform = transform
                 if index > 0 and transform_snapshot is not None:
-                    transform = deepcopy(transform_snapshot)
-                outputs.append(transform(image, target))
+                    frame_transform = deepcopy(transform_snapshot)
+                outputs.append(frame_transform(image, target))
                 if index == 0:
                     post_transform_states = (random.getstate(), np.random.get_state(), torch.random.get_rng_state())
         finally:
@@ -142,9 +241,7 @@ class SharedSequenceTransform:
                 random.setstate(python_state)
                 np.random.set_state(numpy_state)
                 torch.random.set_rng_state(torch_state)
-
-        transformed_images, transformed_targets = zip(*outputs)
-        return tuple(transformed_images), tuple(transformed_targets)
+        return outputs
 
 
 def sequence_collate_fn(
@@ -224,7 +321,7 @@ def _integer(value: Any, field: str, context: str, *, allow_none: bool = False) 
     return value
 
 
-def _parse_object(annotation: Mapping[str, Any]) -> VideoObject:
+def _parse_object(annotation: Mapping[str, Any], *, image_width: int, image_height: int) -> VideoObject:
     """Validate identity metadata from one COCO-style annotation."""
     context = f"annotation {annotation.get('id', '<unknown>')}"
     if "track_id" not in annotation:
@@ -243,7 +340,19 @@ def _parse_object(annotation: Mapping[str, Any]) -> VideoObject:
 
     category_id = _integer(annotation.get("category_id"), "category_id", context)
     annotation_id = _integer(annotation["id"], "id", context) if "id" in annotation else None
-    return VideoObject(annotation_id, category_id, track_id, provenance)
+    bbox = annotation.get("bbox")
+    if not isinstance(bbox, list) or len(bbox) != 4:
+        raise ValueError(f"{context} bbox must be a four-number COCO [x, y, width, height] array")
+    if any(isinstance(value, bool) or not isinstance(value, (int, float)) for value in bbox):
+        raise ValueError(f"{context} bbox must contain only finite numbers")
+    x, y, width, height = (float(value) for value in bbox)
+    if not all(math.isfinite(value) for value in (x, y, width, height)):
+        raise ValueError(f"{context} bbox must contain only finite numbers")
+    if width <= 0 or height <= 0:
+        raise ValueError(f"{context} bbox width and height must be positive")
+    if x < 0 or y < 0 or x + width > image_width or y + height > image_height:
+        raise ValueError(f"{context} bbox {bbox} lies outside image dimensions {(image_width, image_height)}")
+    return VideoObject(annotation_id, category_id, track_id, provenance, (x, y, x + width, y + height))
 
 
 def _parse_frame(
@@ -253,6 +362,13 @@ def _parse_frame(
     """Validate one image record and its aligned object identity metadata."""
     context = f"image {image.get('id', '<unknown>')}"
     image_id = _integer(image.get("id"), "id", context)
+    file_name = image.get("file_name")
+    if not isinstance(file_name, str) or not file_name:
+        raise ValueError(f"{context} file_name must be a non-empty string")
+    width = _integer(image.get("width"), "width", context)
+    height = _integer(image.get("height"), "height", context)
+    if width <= 0 or height <= 0:
+        raise ValueError(f"{context} width and height must be positive")
     sequence_id = _required_alias(image, ("sequence_id", "video_id"), context)
     if isinstance(sequence_id, bool) or not isinstance(sequence_id, (str, int)):
         raise ValueError(f"{context} sequence_id must be a string or integer")
@@ -276,11 +392,11 @@ def _parse_frame(
         if not math.isfinite(timestamp):
             raise ValueError(f"{context} timestamp must be a finite number or null")
 
-    objects = tuple(_parse_object(annotation) for annotation in annotations)
+    objects = tuple(_parse_object(annotation, image_width=width, image_height=height) for annotation in annotations)
     known_ids = [obj.track_id for obj in objects if obj.track_id is not None]
     if len(known_ids) != len(set(known_ids)):
         raise ValueError(f"{context} contains duplicate track_id values")
-    return VideoFrame(image_id, sequence_id, frame_index, timestamp, objects)
+    return VideoFrame(image_id, file_name, width, height, sequence_id, frame_index, timestamp, objects)
 
 
 def build_video_clip_index(

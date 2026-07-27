@@ -3,10 +3,10 @@
   "sessionId": "f316a568-6174-40ad-ba2c-959652f8fa66",
   "status": "running",
   "startedAt": "2026-07-27T09:18:34.243Z",
-  "updatedAt": "2026-07-27T09:24:58.370Z",
-  "currentIteration": 0,
+  "updatedAt": "2026-07-27T09:33:12.228Z",
+  "currentIteration": 2,
   "maxIterations": 0,
-  "tasksCompleted": 0,
+  "tasksCompleted": 2,
   "isPaused": false,
   "agentPlugin": "codex",
   "trackerState": {
@@ -18,14 +18,14 @@
       {
         "id": "US-001",
         "title": "Add the video dataset configuration contract",
-        "status": "open",
-        "completedInSession": false
+        "status": "completed",
+        "completedInSession": true
       },
       {
         "id": "US-002",
         "title": "Implement the sequence image dataset",
-        "status": "open",
-        "completedInSession": false
+        "status": "completed",
+        "completedInSession": true
       },
       {
         "id": "US-003",
@@ -59,7 +59,28 @@
       }
     ]
   },
-  "iterations": [],
+  "iterations": [
+    {
+      "iteration": 1,
+      "status": "completed",
+      "taskId": "US-001",
+      "taskTitle": "Add the video dataset configuration contract",
+      "taskCompleted": true,
+      "durationMs": 324604,
+      "startedAt": "2026-07-27T09:19:33.764Z",
+      "endedAt": "2026-07-27T09:24:58.368Z"
+    },
+    {
+      "iteration": 2,
+      "status": "completed",
+      "taskId": "US-002",
+      "taskTitle": "Implement the sequence image dataset",
+      "taskCompleted": true,
+      "durationMs": 227347,
+      "startedAt": "2026-07-27T09:24:59.415Z",
+      "endedAt": "2026-07-27T09:28:46.762Z"
+    }
+  ],
   "skippedTaskIds": [],
   "cwd": "/home/flaccagora/Desktop/clevis/submodules/rf-detr",
   "activeTaskIds": [],

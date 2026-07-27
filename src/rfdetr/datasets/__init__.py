@@ -30,6 +30,7 @@ from rfdetr.datasets.video import SharedSequenceTransform as SharedSequenceTrans
 from rfdetr.datasets.video import VideoClip as VideoClip
 from rfdetr.datasets.video import VideoFrame as VideoFrame
 from rfdetr.datasets.video import VideoObject as VideoObject
+from rfdetr.datasets.video import VideoSequenceDataset as VideoSequenceDataset
 from rfdetr.datasets.video import build_video_clip_index as build_video_clip_index
 from rfdetr.datasets.video import make_sequence_collate_fn as make_sequence_collate_fn
 from rfdetr.datasets.video import sequence_collate_fn as sequence_collate_fn
