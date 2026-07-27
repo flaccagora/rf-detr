@@ -7,8 +7,10 @@
 
 from __future__ import annotations
 
+import json
 import random
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -17,6 +19,7 @@ from albumentations import Crop, HorizontalFlip, Resize
 from PIL import Image
 from torchvision.transforms.v2 import Compose
 
+from rfdetr.datasets import build_dataset
 from rfdetr.datasets.coco import make_coco_transforms
 from rfdetr.datasets.transforms import AlbumentationsWrapper
 from rfdetr.datasets.video import (
@@ -176,6 +179,38 @@ def test_validation_clip_index_defaults_to_non_overlapping_frames() -> None:
     assert [clip.image_ids for clip in clips] == [(10, 11), (31, 30)]
     evaluated_frames = [(clip.sequence_id, frame.frame_index) for clip in clips for frame in clip.frames]
     assert len(evaluated_frames) == len(set(evaluated_frames))
+
+
+def test_public_dataset_factory_builds_on_disk_video_splits(tmp_path: Path) -> None:
+    """The public dataset boundary should load complete train and validation clips."""
+    annotations = _annotations()
+    for split in ("train", "val"):
+        split_dir = tmp_path / split
+        split_dir.mkdir()
+        for image in annotations["images"]:
+            Image.new("RGB", (image["width"], image["height"])).save(split_dir / image["file_name"])
+        (split_dir / "_annotations.coco.json").write_text(json.dumps(annotations), encoding="utf-8")
+    args = SimpleNamespace(
+        dataset_file="video",
+        dataset_dir=str(tmp_path),
+        tracking=SimpleNamespace(clip_length=2, clip_stride=1, annotation_path=None),
+        multi_scale=False,
+        expanded_scales=False,
+        do_random_resize_via_padding=False,
+        patch_size=4,
+        num_windows=1,
+        aug_config=None,
+    )
+
+    train_dataset = build_dataset("train", args, resolution=8)
+    val_dataset = build_dataset("val", args, resolution=8)
+
+    assert isinstance(train_dataset, VideoSequenceDataset)
+    assert [clip.image_ids for clip in train_dataset.clips] == [(10, 11), (31, 30)]
+    assert [clip.image_ids for clip in val_dataset.clips] == [(10, 11), (31, 30)]
+    images, targets = train_dataset[0]
+    assert len(images) == len(targets) == 2
+    assert all(isinstance(image, torch.Tensor) for image in images)
 
 
 def test_video_dataset_loads_a_chronological_clip_with_aligned_targets(tmp_path: Path) -> None:

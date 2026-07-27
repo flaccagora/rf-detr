@@ -15,7 +15,75 @@ after each iteration and it's included in prompts for context.
   sizing, and gradient-accumulation alignment then operate in clip units without temporal sampler special cases.
 - Give validation its own clip-index boundary: default its stride to the clip length so source frames are scored once,
   while retaining duplicate `(sequence_id, frame_index)` rejection at the evaluation accumulator boundary.
+- A public dataset format is complete only when `build_dataset` resolves its on-disk split convention and constructs
+  the normalized dataset; configuration literals and standalone dataset classes do not make `model.train()` usable.
 
+---
+
+## 2026-07-27 - US-007
+- Added a task-oriented video-tracking training guide covering the conventional on-disk split layout, complete
+  COCO-video schema, chronology and identity invariants, recurrent model configuration, and the public
+  `model.train(dataset_file="video")` invocation.
+- Documented the detection-only, CPU-augmentation, explicit-batch-size, multi-frame, `group_detr=1`, and eager-inference
+  limitations, including the distinction between structural image-checkpoint compatibility and useful temporal
+  fine-tuning.
+- Added the guide to the MkDocs **Train Model** navigation and updated the tracking inference guide to point to the now
+  connected public video dataset adapter instead of describing it as unavailable.
+- Files changed: `docs/learn/train/video.md`, `docs/learn/run/tracking.md`, `mkdocs.yaml`,
+  `.ralph-tui/progress.md`.
+- Verification:
+  - `HF_HOME=/tmp/clevis-hf docker compose run --rm -v
+    "$PWD/submodules/rf-detr:/app/submodules/rf-detr:ro" clevis -lc 'python -m pip install -q pytest pytest-timeout
+    pytest-doctestplus && cd /app/submodules/rf-detr && PYTHONPATH=src python -m pytest -q
+    tests/models/test_video_train_config.py tests/datasets/test_video.py tests/training/test_module_data.py
+    tests/training/test_module_model.py tests/training/test_trainer_smoke.py tests/evaluation/test_sequence.py'` (from the
+    Clevis root) — blocked because access to `/var/run/docker.sock` was denied.
+  - `pre-commit run --all-files` — unavailable (`pre-commit: command not found`).
+  - `UV_CACHE_DIR=/tmp/rfdetr-uv-cache uv run --no-sync mkdocs build --strict` — unavailable because `mkdocs` is not
+    installed in the repository environment. The first attempt with uv's default cache was additionally blocked by its
+    read-only host cache.
+  - Changed-document local-link validation — passed; every relative link resolves on disk.
+  - Stale public-adapter wording search and `git diff --check` — passed.
+- **Learnings:**
+  - Training and streaming inference are best documented as neighboring tasks: training owns the COCO-video data and
+    recurrent fine-tuning contract, while inference owns session lifecycle and eager-state constraints.
+  - Image-checkpoint compatibility must be described as initialization compatibility, not temporal capability; useful
+    persistent identities require fine-tuning on chronological identity annotations.
+---
+
+## 2026-07-27 - US-006
+- Registered the video format at the public dataset factory, including conventional `train/` and `val/` annotation
+  discovery, explicit annotation-path support, training sliding clips, non-overlapping validation clips, and existing
+  RF-DETR detection transforms wrapped for sequence-consistent geometry.
+- Added a tiny on-disk public-training smoke that invokes `RFDETR.train(dataset_file="video")`, executes Lightning
+  training and validation through real data/module boundaries, checks empty-to-predicted recurrent state flow, verifies
+  image-checkpoint initialization uses the canonical loader, and checks serialized video/tracking configuration.
+- Kept the existing ordinary detection smoke intact and added focused public dataset-factory coverage for both video
+  splits.
+- Files changed: `src/rfdetr/datasets/__init__.py`, `tests/datasets/test_video.py`,
+  `tests/training/test_trainer_smoke.py`, `.ralph-tui/progress.md`.
+- Verification:
+  - `UV_CACHE_DIR=/tmp/rfdetr-uv-cache uv run --no-sync pytest -q tests/datasets/test_video.py -k
+    public_dataset_factory_builds_on_disk_video_splits` — blocked during collection because the host Transformers
+    installation lacks `BackboneConfigMixin`.
+  - `.venv/bin/python -c 'import transformers; print(transformers.__version__); from transformers import
+    BackboneConfigMixin'` — blocked because the repository-local environment has no `transformers` installation.
+  - `HF_HOME=/tmp/clevis-hf docker compose run --rm -v
+    "$PWD/submodules/rf-detr:/app/submodules/rf-detr:ro" clevis -lc 'python -m pip install -q pytest pytest-timeout
+    pytest-doctestplus && cd /app/submodules/rf-detr && PYTHONPATH=src python -m pytest -q
+    tests/datasets/test_video.py tests/training/test_trainer_smoke.py tests/training/test_module_model.py
+    tests/training/test_load_pretrain_weights.py'` (from Clevis root) — blocked because access to
+    `/var/run/docker.sock` was denied.
+  - `pre-commit run --all-files` — unavailable (`pre-commit: command not found`).
+  - `ruff check` (including its safe import fixes), `ruff format --check`, `python -m compileall`, and
+    `git diff --check` for the affected source and tests — passed.
+- **Learnings:**
+  - The recurrent model loop and clip DataLoader were already present, but the missing `build_dataset("video", ...)`
+    registration made the entire public feature unreachable; public-boundary smoke tests catch this integration gap.
+  - Using the ordinary detection transform builder at the format adapter preserves image-training preprocessing while
+    `VideoSequenceDataset` supplies the sequence-specific shared-randomness semantics.
+  - A tiny recurrent network can exercise Lightning optimization and checkpoint initialization without weakening the
+    on-disk dataset boundary: only heavyweight model construction needs substitution.
 ---
 
 ## 2026-07-27 - US-005

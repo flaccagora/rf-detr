@@ -12,14 +12,20 @@ real dataset or GPU is required.
 Chapter 1 gate: these must pass before Chapter 2 begins.
 """
 
+import json
 import sys
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+from PIL import Image
 from pytorch_lightning import Trainer
 
-from rfdetr.config import SegmentationTrainConfig
+from rfdetr.config import RFDETRBaseConfig, SegmentationTrainConfig, TrainConfig
+from rfdetr.detr import RFDETR
+from rfdetr.models.tracking import TrackingFrameOutput, TrackQueryState
 from rfdetr.training import build_trainer
 from rfdetr.training.module_data import RFDETRDataModule
 from rfdetr.training.module_model import RFDETRModelModule
@@ -48,6 +54,133 @@ def _make_trainer() -> Trainer:
         enable_model_summary=False,
         logger=False,
     )
+
+
+class _TinyRecurrentModel(_TinyModel):
+    """Tiny trainable tracking model that records every recurrent input."""
+
+    def __init__(self, model_config: RFDETRBaseConfig) -> None:
+        super().__init__()
+        self.model_config = model_config
+        self.prior_states: list[TrackQueryState] = []
+
+    def forward_tracking(self, samples, prior_state=None):
+        """Return candidate state derived from the tiny trainable parameter."""
+        self.prior_states.append(prior_state)
+        batch_size = samples.tensors.shape[0]
+        features = self.dummy.expand(batch_size, self.model_config.num_queries, self.model_config.hidden_dim)
+        boxes = (self.dummy + 0.5).expand(batch_size, self.model_config.num_queries, 4)
+        logits = self.dummy.expand(
+            batch_size,
+            self.model_config.num_queries,
+            self.model_config.num_classes + 1,
+        )
+        return TrackingFrameOutput(
+            pred_logits=logits,
+            pred_boxes=boxes,
+            candidate_state=TrackQueryState(features, boxes, torch.ones_like(prior_state.active_mask)),
+            input_active_mask=prior_state.active_mask,
+        )
+
+
+class _TinyTrackingCriterion(_FakeCriterion):
+    """Criterion supporting identity-aware recurrent assignment."""
+
+    matcher = staticmethod(lambda outputs, targets: [(torch.tensor([0]), torch.tensor([0]))])
+
+    def __call__(self, outputs, targets, assignments=None, num_boxes=None):
+        """Return a differentiable scalar loss for one recurrent frame."""
+        return {"loss_ce": outputs["pred_logits"].mean()}
+
+
+def _write_video_split(root: Path, split: str) -> None:
+    """Write one two-frame COCO-video clip for a public training smoke test."""
+    split_dir = root / split
+    split_dir.mkdir(parents=True)
+    images = []
+    annotations = []
+    for frame_index in range(2):
+        file_name = f"frame-{frame_index}.png"
+        Image.new("RGB", (16, 16), color=(frame_index * 20, 0, 0)).save(split_dir / file_name)
+        images.append(
+            {
+                "id": frame_index,
+                "file_name": file_name,
+                "width": 16,
+                "height": 16,
+                "sequence_id": "tiny",
+                "frame_index": frame_index,
+            }
+        )
+        annotations.append(
+            {
+                "id": frame_index,
+                "image_id": frame_index,
+                "category_id": 0,
+                "bbox": [2, 2, 4, 4],
+                "track_id": 7,
+                "identity_provenance": "human",
+            }
+        )
+    (split_dir / "_annotations.coco.json").write_text(
+        json.dumps({"images": images, "annotations": annotations, "categories": [{"id": 0, "name": "object"}]}),
+        encoding="utf-8",
+    )
+
+
+def test_public_train_runs_one_recurrent_train_and_validation_batch(tmp_path: Path) -> None:
+    """``RFDETR.train(dataset_file='video')`` should exercise a complete recurrent fit."""
+    dataset_root = tmp_path / "video"
+    _write_video_split(dataset_root, "train")
+    _write_video_split(dataset_root, "val")
+    output_dir = tmp_path / "output"
+    model_config = RFDETRBaseConfig(
+        pretrain_weights=str(tmp_path / "image-checkpoint.pth"),
+        device="cpu",
+        num_classes=1,
+        group_detr=1,
+        tracking={"enabled": True},
+    )
+    train_config = TrainConfig(
+        dataset_file="video",
+        dataset_dir=str(dataset_root),
+        output_dir=str(output_dir),
+        epochs=1,
+        batch_size=1,
+        grad_accum_steps=1,
+        num_workers=0,
+        multi_scale=False,
+        expanded_scales=False,
+        tensorboard=False,
+        use_ema=False,
+        tracking={"clip_length": 2, "clip_stride": 1},
+    )
+    public_model = MagicMock()
+    public_model.model_config = model_config
+    public_model.model = SimpleNamespace(model=object(), class_names=["object"], args=SimpleNamespace())
+    public_model.get_train_config.return_value = train_config
+    tiny_model = _TinyRecurrentModel(model_config)
+    criterion = _TinyTrackingCriterion()
+
+    with (
+        patch("rfdetr.training.module_model.build_model_from_config", return_value=tiny_model),
+        patch("rfdetr.training.module_model.load_pretrain_weights") as load_pretrain_weights,
+        patch(
+            "rfdetr.training.module_model.build_criterion_from_config",
+            return_value=(criterion, _FakePostProcess()),
+        ),
+        patch("rfdetr.training.module_model.get_param_dict", side_effect=lambda args, model: _make_param_dicts(model)),
+        patch("rfdetr.training.build_trainer", return_value=_make_trainer()),
+    ):
+        RFDETR.train(public_model, dataset_file="video")
+
+    load_pretrain_weights.assert_called_once_with(tiny_model, model_config)
+    assert len(tiny_model.prior_states) >= 4
+    assert all(not state.active_mask.any() for state in tiny_model.prior_states[::2])
+    assert all(state.active_mask[0, 0] for state in tiny_model.prior_states[1::2])
+    saved = json.loads((output_dir / "training_config.json").read_text(encoding="utf-8"))
+    assert saved["train_config"]["dataset_file"] == "video"
+    assert saved["train_config"]["tracking"]["clip_length"] == 2
 
 
 # ---------------------------------------------------------------------------

@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -24,7 +25,7 @@ from torch.utils.data import Dataset, Subset
 
 from rfdetr.datasets._keypoint_schema import infer_coco_keypoint_schema as infer_coco_keypoint_schema
 from rfdetr.datasets._keypoint_schema import infer_yolo_keypoint_schema as infer_yolo_keypoint_schema
-from rfdetr.datasets.coco import build_coco, build_roboflow_from_coco
+from rfdetr.datasets.coco import build_coco, build_roboflow_from_coco, make_coco_transforms
 from rfdetr.datasets.o365 import build_o365
 from rfdetr.datasets.video import SharedSequenceTransform as SharedSequenceTransform
 from rfdetr.datasets.video import VideoClip as VideoClip
@@ -95,6 +96,63 @@ def build_roboflow(image_set: str, args: Any, resolution: int) -> Dataset[Any]:
     return build_roboflow_from_yolo(image_set, args, resolution)
 
 
+def build_video(image_set: str, args: Any, resolution: int) -> VideoSequenceDataset:
+    """Build a chronological video dataset from an on-disk COCO-video split.
+
+    Args:
+        image_set: Dataset split, normally ``"train"`` or ``"val"``.
+        args: Combined model and training configuration namespace.
+        resolution: Model input resolution.
+
+    Returns:
+        A clip-atomic sequence dataset with ordinary RF-DETR transforms.
+
+    Raises:
+        FileNotFoundError: If the dataset root or annotation file is missing.
+        ValueError: If the annotation JSON is not an object or contains an
+            invalid video schema.
+    """
+    root = Path(args.dataset_dir)
+    if not root.is_dir():
+        raise FileNotFoundError(f"video dataset path {root} does not exist")
+
+    configured_path = args.tracking.annotation_path
+    if configured_path is None:
+        annotation_path = root / image_set / "_annotations.coco.json"
+        image_root = root / image_set
+    else:
+        annotation_path = Path(configured_path)
+        if not annotation_path.is_absolute():
+            annotation_path = root / annotation_path
+        image_root = root
+    if not annotation_path.is_file():
+        raise FileNotFoundError(f"video annotation file does not exist at {annotation_path}")
+
+    with annotation_path.open(encoding="utf-8") as annotation_file:
+        annotations = json.load(annotation_file)
+    if not isinstance(annotations, dict):
+        raise ValueError(f"video annotation file {annotation_path} must contain a JSON object")
+
+    clip_length = args.tracking.clip_length
+    clips = (
+        build_video_clip_index(annotations, clip_length, args.tracking.clip_stride)
+        if image_set == "train"
+        else build_video_validation_clip_index(annotations, clip_length)
+    )
+    transform = make_coco_transforms(
+        image_set=image_set,
+        resolution=resolution,
+        multi_scale=args.multi_scale,
+        expanded_scales=args.expanded_scales,
+        skip_random_resize=args.do_random_resize_via_padding,
+        patch_size=args.patch_size,
+        num_windows=args.num_windows,
+        aug_config=args.aug_config,
+        gpu_postprocess=False,
+    )
+    return VideoSequenceDataset(image_root, clips, transform)
+
+
 def build_dataset(image_set: str, args: Any, resolution: int) -> Dataset[Any]:
     if args.dataset_file == "coco":
         return build_coco(image_set, args, resolution)
@@ -104,4 +162,6 @@ def build_dataset(image_set: str, args: Any, resolution: int) -> Dataset[Any]:
         return build_roboflow(image_set, args, resolution)
     if args.dataset_file == "yolo":
         return build_roboflow_from_yolo(image_set, args, resolution)
+    if args.dataset_file == "video":
+        return build_video(image_set, args, resolution)
     raise ValueError(f"dataset {args.dataset_file} not supported")

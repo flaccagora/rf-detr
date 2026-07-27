@@ -180,9 +180,11 @@ if timing is not None:
 
 State memory and query count remain fixed across a sequence. Latency should therefore be evaluated as a per-frame distribution and checked with a long-sequence run.
 
-## Sequence-training data contract
+## Train for temporal behavior
 
-The repository includes sequence indexing, shared-transform, collation, recurrent training, and identity-aware loss primitives. The high-level dataset builder does not yet construct video datasets automatically, so using these primitives currently requires a custom dataset/DataLoader integration.
+The public video dataset adapter connects sequence indexing, shared transforms, clip collation, recurrent training, and
+identity-aware loss to `model.train(dataset_file="video")`. See [Train RF-DETR for Video Tracking](../train/video.md) for
+the on-disk COCO-video schema, identity rules, model configuration, and complete training invocation.
 
 Video annotations use COCO-style `images` and `annotations` arrays with additional explicit temporal fields:
 
@@ -240,7 +242,8 @@ clips = build_video_clip_index(
 )
 ```
 
-Tracking training also requires architecture tracking to be enabled with `group_detr=1` and a `TrackingTrainConfig` whose `clip_length` matches the DataLoader output. Treat this interface as advanced until a public video dataset adapter is connected to `model.train()`.
+Tracking training requires architecture tracking to be enabled with `group_detr=1` and a `TrackingTrainConfig` whose
+`clip_length` is greater than one. The public adapter constructs complete clips of that length.
 
 ## Unsupported operations
 
