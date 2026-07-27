@@ -14,7 +14,7 @@ from PIL import Image
 from rfdetr.config import TrackingConfig, TrackingSessionConfig
 from rfdetr.detr import RFDETR
 from rfdetr.models.tracking import TrackingFrameOutput, TrackQueryState
-from rfdetr.tracking import TrackingSession
+from rfdetr.tracking import TrackingSession, TrackingTiming
 
 
 class _TrackingModule(torch.nn.Module):
@@ -119,3 +119,29 @@ class TestTrackingSession:
             session.update(torch.zeros(3, 6, 10))
 
         assert session.active_tracks == ()
+
+    def test_opt_in_timing_reports_tracking_overhead(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Timing separates neural latency from session orchestration overhead."""
+        ticks = iter([1.0, 1.002, 1.010, 1.013, 1.020])
+        monkeypatch.setattr("rfdetr.tracking.session.perf_counter", lambda: next(ticks))
+        session = TrackingSession(_owner(), TrackingSessionConfig(collect_timing=True))
+
+        detections = session.update(torch.zeros(3, 6, 10))
+
+        assert isinstance(session.last_timing, TrackingTiming)
+        assert session.last_timing.preprocessing_ms == pytest.approx(2.0)
+        assert session.last_timing.model_ms == pytest.approx(8.0)
+        assert session.last_timing.lifecycle_ms == pytest.approx(3.0)
+        assert session.last_timing.output_ms == pytest.approx(7.0)
+        assert session.last_timing.total_ms == pytest.approx(20.0)
+        assert session.last_timing.tracking_overhead_ms == pytest.approx(10.0)
+        assert detections.metadata["timing"] == session.last_timing
+
+    def test_timing_is_disabled_by_default(self) -> None:
+        """Ordinary sessions avoid synchronization and timing overhead."""
+        session = TrackingSession(_owner())
+
+        detections = session.update(torch.zeros(3, 6, 10))
+
+        assert session.last_timing is None
+        assert "timing" not in detections.metadata

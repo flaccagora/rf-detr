@@ -35,6 +35,9 @@ after each iteration and it's included in prompts for context.
   losses, and commit predicted candidate tensors under assignment-guided or confidence-gated lifecycle policy.
 - Sequence evaluation retains one rich provenance record while deriving identity-free detection views and per-sequence
   MOTChallenge streams; sequence grouping is the reset boundary that scopes otherwise reusable session-local track IDs.
+- Optional performance instrumentation belongs at the public session boundary and stays disabled by default; CUDA
+  timings synchronize at phase boundaries, while stateless acceleration/export entry points reject tracking before
+  performing imports, copies, tracing, or mutation.
 
 ---
 
@@ -305,4 +308,22 @@ after each iteration and it's included in prompts for context.
   - Ordinary pytest collection remains blocked by the host Transformers package lacking `BackboneConfigMixin`.
     Dependency-isolated behavioral checks, Python compilation, Ruff lint/format, and `git diff --check` pass;
     `pre-commit` and typecheck tools are unavailable.
+---
+
+## 2026-07-27 - US-017
+- Added opt-in synchronized tracking-session timing with preprocessing, neural forward, lifecycle, output, total, and
+  derived host tracking-overhead measurements exposed both on the session and returned detection metadata.
+- Rejected tracking-enabled `optimize_for_inference()` and ONNX/TFLite `export()` calls before any stateless graph
+  construction or model mutation, with actionable eager-session guidance.
+- Kept timing disabled by default so existing streaming behavior has no clock or CUDA-synchronization overhead.
+- Files changed: `src/rfdetr/config.py`, `src/rfdetr/detr.py`, `src/rfdetr/tracking/session.py`,
+  `src/rfdetr/tracking/__init__.py`, `tests/models/test_tracking_session.py`,
+  `tests/inference/test_optimize_for_inference.py`, `tests/export/test_export.py`, `.ralph-tui/progress.md`.
+- **Learnings:**
+  - Accurate GPU phase measurements require explicit device synchronization because CUDA kernels are asynchronous;
+    making measurement opt-in prevents that synchronization from distorting normal deployment latency.
+  - Unsupported stateful capabilities must be rejected at the public acceleration boundary, not only when a session is
+    later updated, so export/optimization cannot produce a seemingly valid stateless artifact.
+  - Ordinary pytest collection remains blocked by the host Transformers package lacking `BackboneConfigMixin`.
+    Python compilation, Ruff lint/format, and `git diff --check` pass; `pre-commit` and `mypy` are unavailable.
 ---

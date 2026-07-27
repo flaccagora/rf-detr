@@ -12,7 +12,7 @@ from rfdetr.tracking.lifecycle import (
     TrackSlotTable,
     transition_lifecycle,
 )
-from rfdetr.tracking.session import TrackingSession
+from rfdetr.tracking.session import TrackingSession, TrackingTiming
 
 __all__ = [
     "LifecycleEvent",
@@ -20,5 +20,6 @@ __all__ = [
     "TrackSlot",
     "TrackSlotTable",
     "TrackingSession",
+    "TrackingTiming",
     "transition_lifecycle",
 ]

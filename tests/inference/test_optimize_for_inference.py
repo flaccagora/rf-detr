@@ -11,6 +11,7 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from rfdetr.config import TrackingConfig
 from rfdetr.detr import RFDETR
 
 
@@ -49,6 +50,16 @@ class _FakeRFDETR(RFDETR):
 
 class TestOptimizeForInferenceDtype:
     """Dtype coercion and validation tests."""
+
+    def test_tracking_model_is_rejected_before_optimization(self) -> None:
+        """Stateless optimization cannot silently remove recurrent state I/O."""
+        rfdetr = _FakeRFDETR()
+        rfdetr.model_config.tracking = TrackingConfig(enabled=True)
+
+        with pytest.raises(RuntimeError, match="does not support tracking"):
+            rfdetr.optimize_for_inference(compile=False)
+
+        assert rfdetr.model.inference_model is None
 
     def test_string_dtype_float32_is_accepted(self) -> None:
         """Passing dtype='float32' (str) should be coerced to torch.float32."""

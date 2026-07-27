@@ -956,7 +956,8 @@ class RFDETR:
                 string that does not correspond to a valid ``torch.dtype`` attribute.
             ValueError: If ``dtype`` is not a floating-point dtype, or if ``inplace=True`` is used with
                 ``compile=True``.
-            RuntimeError: If the base model has already been cleared by a previous inplace optimization.
+            RuntimeError: If tracking is enabled, or if the base model has already been cleared by a previous inplace
+                optimization.
 
         Examples:
             >>> from types import SimpleNamespace
@@ -1003,6 +1004,11 @@ class RFDETR:
             >>> model._optimized_inplace
             True
         """
+        if getattr(getattr(self.model_config, "tracking", None), "enabled", False):
+            raise RuntimeError(
+                "optimize_for_inference() does not support tracking because its stateless graph omits recurrent "
+                "state inputs and outputs; use TrackingSession with the eager PyTorch model."
+            )
         if isinstance(dtype, str):
             try:
                 dtype = getattr(torch, dtype)
@@ -1241,7 +1247,15 @@ class RFDETR:
 
         Returns:
             Path to the exported model file (``.onnx`` or ``.tflite``).
+
+        Raises:
+            RuntimeError: If tracking is enabled because current export formats do not expose recurrent state I/O.
         """
+        if getattr(getattr(self.model_config, "tracking", None), "enabled", False):
+            raise RuntimeError(
+                "RFDETR.export() does not support tracking because exported graphs omit recurrent state inputs and "
+                "outputs; disable tracking or use TrackingSession with the eager PyTorch model."
+            )
         logger.info("Exporting model to ONNX format")
         _valid_formats = ("onnx", "tflite")
         if format not in _valid_formats:

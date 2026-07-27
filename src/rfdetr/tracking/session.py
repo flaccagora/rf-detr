@@ -8,6 +8,8 @@
 from __future__ import annotations
 
 import io
+from dataclasses import dataclass
+from time import perf_counter
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
@@ -25,6 +27,22 @@ if TYPE_CHECKING:
     from supervision import Detections
 
     from rfdetr.detr import RFDETR
+
+
+@dataclass(frozen=True)
+class TrackingTiming:
+    """Synchronized latency breakdown for one tracking update, in milliseconds."""
+
+    preprocessing_ms: float
+    model_ms: float
+    lifecycle_ms: float
+    output_ms: float
+    total_ms: float
+
+    @property
+    def tracking_overhead_ms(self) -> float:
+        """Return non-neural session latency, excluding preprocessing."""
+        return self.lifecycle_ms + self.output_ms
 
 
 class TrackingSession:
@@ -51,6 +69,7 @@ class TrackingSession:
         self._state: TrackQueryState | None = None
         self._next_frame_index = 0
         self._last_events: tuple[LifecycleEvent, ...] = ()
+        self._last_timing: TrackingTiming | None = None
 
     @property
     def active_tracks(self) -> tuple[TrackSlot, ...]:
@@ -62,12 +81,18 @@ class TrackingSession:
         """Return lifecycle diagnostics emitted by the most recent update."""
         return self._last_events
 
+    @property
+    def last_timing(self) -> TrackingTiming | None:
+        """Return the most recent timing breakdown when collection is enabled."""
+        return self._last_timing
+
     def reset(self) -> None:
         """Clear neural and host state and restart session-local IDs at zero."""
         self._table = TrackSlotTable.empty(self._model.model_config.num_queries)
         self._state = None
         self._next_frame_index = 0
         self._last_events = ()
+        self._last_timing = None
 
     @torch.inference_mode()
     def update(
@@ -95,6 +120,7 @@ class TrackingSession:
             raise RuntimeError(
                 "TrackingSession does not support optimized or exported inference; use the eager PyTorch model."
             )
+        started_at = self._timing_mark()
         from rfdetr.detr import _move_model_context_to_device
 
         _move_model_context_to_device(self._model.model)
@@ -122,7 +148,9 @@ class TrackingSession:
             )
 
         tensor = tensor.to(dtype=self._state.query_features.dtype)
+        preprocessed_at = self._timing_mark()
         frame_output = module.forward_tracking(tensor, self._state)
+        model_finished_at = self._timing_mark()
         transition = transition_lifecycle(
             self._table,
             self._state,
@@ -135,6 +163,7 @@ class TrackingSession:
         self._state = transition.state
         self._last_events = transition.events
         self._next_frame_index = frame_index + 1
+        lifecycle_finished_at = self._timing_mark()
 
         visible_slots = [index for index, slot in enumerate(self._table.slots) if slot.status == "active"]
         height, width = original_size
@@ -163,7 +192,30 @@ class TrackingSession:
         detections.metadata["frame_index"] = frame_index
         detections.metadata["timestamp"] = timestamp
         detections.metadata["lifecycle_events"] = self._last_events
+        finished_at = self._timing_mark()
+        if started_at is not None:
+            assert preprocessed_at is not None
+            assert model_finished_at is not None
+            assert lifecycle_finished_at is not None
+            assert finished_at is not None
+            self._last_timing = TrackingTiming(
+                preprocessing_ms=(preprocessed_at - started_at) * 1000,
+                model_ms=(model_finished_at - preprocessed_at) * 1000,
+                lifecycle_ms=(lifecycle_finished_at - model_finished_at) * 1000,
+                output_ms=(finished_at - lifecycle_finished_at) * 1000,
+                total_ms=(finished_at - started_at) * 1000,
+            )
+            detections.metadata["timing"] = self._last_timing
         return detections
+
+    def _timing_mark(self) -> float | None:
+        """Return a synchronized timestamp when timing collection is enabled."""
+        if not self._config.collect_timing:
+            return None
+        device = self._model.model.device
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        return perf_counter()
 
     def _prepare_frame(
         self, frame: str | Image.Image | np.ndarray | torch.Tensor
@@ -198,4 +250,4 @@ class TrackingSession:
         return image, original_size
 
 
-__all__ = ["TrackingSession"]
+__all__ = ["TrackingSession", "TrackingTiming"]

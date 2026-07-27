@@ -29,9 +29,20 @@ from torch.jit import TracerWarning
 
 from rfdetr import RFDETRSegNano
 from rfdetr import detr as _detr_module
+from rfdetr.config import TrackingConfig
 from rfdetr.export import main as _cli_export_module
 
 _IS_ONNX_INSTALLED = importlib.util.find_spec("onnx") is not None
+
+
+def test_tracking_model_export_is_rejected_before_loading_export_dependencies(tmp_path: Path) -> None:
+    """Stateless export formats cannot silently omit recurrent state inputs and outputs."""
+    model = types.SimpleNamespace(model_config=types.SimpleNamespace(tracking=TrackingConfig(enabled=True)))
+
+    with pytest.raises(RuntimeError, match="does not support tracking"):
+        _detr_module.RFDETR.export(model, output_dir=str(tmp_path))
+
+    assert not tmp_path.iterdir()
 
 
 @contextmanager

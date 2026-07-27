@@ -157,12 +157,15 @@ class TrackingSessionConfig(BaseConfig):
             treated as a duplicate.
         max_missed_frames: Number of missed source frames tolerated before a
             suspended track is terminated.
+        collect_timing: Collect synchronized per-frame latency measurements.
+            Disabled by default to avoid adding measurement overhead.
     """
 
     activation_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
     continuation_threshold: float = Field(default=0.3, ge=0.0, le=1.0)
     duplicate_iou_threshold: float = Field(default=0.7, ge=0.0, le=1.0)
     max_missed_frames: int = Field(default=30, ge=0)
+    collect_timing: bool = False
 
 
 class ModelConfig(BaseConfig):
