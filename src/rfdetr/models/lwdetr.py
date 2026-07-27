@@ -35,6 +35,7 @@ from rfdetr.models.backbone import build_backbone
 # Backward-compat re-exports: loss functions that used to live in this module
 from rfdetr.models.criterion import (  # noqa: F401 — backward compat
     SetCriterion,
+    TrackingSetCriterion,
     dice_loss,
     dice_loss_jit,
     position_supervised_loss,
@@ -940,7 +941,8 @@ def build_criterion_and_postprocessors(args: "BuilderArgs"):
 
     sum_group_losses = getattr(args, "sum_group_losses", False)
     if args.segmentation_head:
-        criterion = SetCriterion(
+        criterion_class = TrackingSetCriterion if getattr(args, "tracking_enabled", False) else SetCriterion
+        criterion = criterion_class(
             args.num_classes + 1,
             matcher=matcher,
             weight_dict=weight_dict,
@@ -955,7 +957,8 @@ def build_criterion_and_postprocessors(args: "BuilderArgs"):
             num_keypoints_per_class=getattr(args, "num_keypoints_per_class", []),
         )
     else:
-        criterion = SetCriterion(
+        criterion_class = TrackingSetCriterion if getattr(args, "tracking_enabled", False) else SetCriterion
+        criterion = criterion_class(
             args.num_classes + 1,
             matcher=matcher,
             weight_dict=weight_dict,
@@ -1043,4 +1046,7 @@ def build_criterion_from_config(
     from rfdetr._namespace import _namespace_from_configs
 
     ns = _namespace_from_configs(model_config, train_config, defaults)
+    # The transitional flat namespace intentionally excludes nested capability configs. Add only this builder-local
+    # switch so legacy namespace parity remains unchanged.
+    ns.tracking_enabled = model_config.tracking.enabled
     return build_criterion_and_postprocessors(ns)

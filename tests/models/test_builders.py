@@ -135,6 +135,17 @@ class TestBuildCriterionFromConfig:
         assert isinstance(criterion, SetCriterion), f"Expected SetCriterion, got {type(criterion).__name__}"
         assert isinstance(postprocess, PostProcess), f"Expected PostProcess, got {type(postprocess).__name__}"
 
+    def test_tracking_builds_identity_aware_criterion(self) -> None:
+        """Tracking-enabled fine-tuning must select the criterion that consumes sequence assignments."""
+        from rfdetr.models.criterion import TrackingSetCriterion
+
+        mc = RFDETRBaseConfig(num_classes=80, group_detr=1, tracking={"enabled": True})
+        tc = TrainConfig(dataset_dir="/tmp")
+
+        criterion, _ = build_criterion_from_config(mc, tc)
+
+        assert isinstance(criterion, TrackingSetCriterion)
+
     def test_num_select_postprocess(self) -> None:
         """RFDETRSegNanoConfig has num_select=100; PostProcess must reflect it."""
         mc = RFDETRSegNanoConfig()

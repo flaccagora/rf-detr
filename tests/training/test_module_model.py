@@ -14,6 +14,8 @@ import torch
 from torch import nn
 
 from rfdetr.config import RFDETRBaseConfig, TrainConfig
+from rfdetr.models.matcher import SequenceAssignment
+from rfdetr.models.tracking import TrackingFrameOutput, TrackQueryState
 from rfdetr.models.weights import apply_lora, load_pretrain_weights
 from rfdetr.utilities.tensors import NestedTensor
 
@@ -1222,6 +1224,89 @@ class TestRescaleAccumulatedGradients:
 
         assert nano_model.weight.grad is None
         assert nano_model.bias.grad is None
+
+
+class TestRecurrentTrainingStep:
+    """Tests for causal time-major video training."""
+
+    @pytest.mark.parametrize(
+        "detach_state,expected_requires_grad",
+        [
+            pytest.param(False, True, id="temporal-gradients"),
+            pytest.param(True, False, id="detached-boundary"),
+        ],
+    )
+    def test_carries_predicted_state_and_averages_frame_losses(self, tmp_path, detach_state, expected_requires_grad):
+        """Every frame should consume the preceding prediction and contribute equally to the clip loss."""
+        mc = _base_model_config(tracking={"enabled": True}, group_detr=1)
+        tc = _base_train_config(
+            tmp_path,
+            tracking={"clip_length": 2, "detach_state_between_frames": detach_state},
+        )
+        module, _, criterion, _ = _build_module(model_config=mc, train_config=tc, tmp_path=tmp_path)
+        frame_batches = (_make_batch(batch_size=1)[0], _make_batch(batch_size=1)[0])
+        target_batches = tuple(
+            (
+                {
+                    "boxes": torch.tensor([[0.5, 0.5, 0.2, 0.2]]),
+                    "labels": torch.tensor([1]),
+                    "track_ids": torch.tensor([7]),
+                    "orig_size": torch.tensor([16, 16]),
+                },
+            )
+            for _ in range(2)
+        )
+
+        class CausalModel:
+            def __init__(self) -> None:
+                self.prior_states: list[TrackQueryState | None] = []
+
+            def forward_tracking(self, samples, prior_state=None):
+                self.prior_states.append(prior_state)
+                value = float(len(self.prior_states))
+                features = torch.full((1, mc.num_queries, mc.hidden_dim), value, requires_grad=True)
+                boxes = torch.full((1, mc.num_queries, 4), 0.5, requires_grad=True)
+                active_mask = (
+                    torch.zeros((1, mc.num_queries), dtype=torch.bool)
+                    if prior_state is None
+                    else prior_state.active_mask
+                )
+                return TrackingFrameOutput(
+                    pred_logits=torch.zeros((1, mc.num_queries, mc.num_classes + 1), requires_grad=True),
+                    pred_boxes=boxes,
+                    candidate_state=TrackQueryState(features, boxes, torch.ones_like(active_mask)),
+                    input_active_mask=active_mask,
+                )
+
+        causal_model = CausalModel()
+        module.model = causal_model
+        criterion.matcher = MagicMock()
+        criterion.matcher.return_value = [(torch.tensor([0]), torch.tensor([0]))]
+        criterion.side_effect = [
+            {"loss_ce": torch.tensor(2.0, requires_grad=True)},
+            {"loss_ce": torch.tensor(4.0, requires_grad=True)},
+        ]
+        criterion.weight_dict = {"loss_ce": 1.0}
+        module.log = MagicMock()
+        module.log_dict = MagicMock()
+        real_param = nn.Parameter(torch.randn(1))
+        module.optimizers = MagicMock(return_value=torch.optim.SGD([real_param], lr=1e-3))
+        module._trainer = SimpleNamespace(accumulate_grad_batches=1)
+        type(module).trainer = property(lambda self: self._trainer)
+
+        loss = module.training_step((frame_batches, target_batches), batch_idx=0)
+
+        assert loss.item() == pytest.approx(3.0)
+        first_prior = causal_model.prior_states[0]
+        assert first_prior is not None
+        assert not first_prior.active_mask.any()
+        second_prior = causal_model.prior_states[1]
+        assert second_prior is not None
+        assert second_prior.active_mask[0, 0]
+        assert second_prior.query_features.requires_grad is expected_requires_grad
+        torch.testing.assert_close(second_prior.query_features[0, 0], torch.ones(mc.hidden_dim))
+        assert criterion.call_count == 2
+        assert isinstance(criterion.call_args_list[0].args[2][0], SequenceAssignment)
 
 
 class TestValidationStep:

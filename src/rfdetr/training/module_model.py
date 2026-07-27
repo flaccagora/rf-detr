@@ -17,9 +17,11 @@ import torch.nn.functional as F  # noqa: N812 -- project-conventional alias (see
 from pytorch_lightning import LightningModule, seed_everything
 
 from rfdetr._namespace import _namespace_from_configs
-from rfdetr.config import ModelConfig, TrainConfig
+from rfdetr.config import ModelConfig, TrackingSessionConfig, TrainConfig
 from rfdetr.datasets.coco import compute_multi_scale_scales
 from rfdetr.models.lwdetr import build_criterion_from_config, build_model_from_config
+from rfdetr.models.matcher import SequenceAssignment, identity_aware_sequence_assignment
+from rfdetr.models.tracking import TrackingFrameOutput, TrackQueryState
 from rfdetr.models.weights import apply_lora, interpolate_position_embeddings, load_pretrain_weights
 from rfdetr.training.param_groups import get_param_dict
 from rfdetr.utilities.logger import get_logger
@@ -146,10 +148,16 @@ class RFDETRModelModule(LightningModule):
             # without reseeding the process-global RNG on every batch.
             scale = random.Random(step).choice(scales)
             with torch.no_grad():
-                samples.tensors = F.interpolate(samples.tensors, size=scale, mode="bilinear", align_corners=False)
-                samples.mask = (
-                    F.interpolate(samples.mask.unsqueeze(1).float(), size=scale, mode="nearest").squeeze(1).bool()
-                )
+                sample_batches = samples if isinstance(samples, (tuple, list)) else (samples,)
+                for frame_samples in sample_batches:
+                    frame_samples.tensors = F.interpolate(
+                        frame_samples.tensors, size=scale, mode="bilinear", align_corners=False
+                    )
+                    frame_samples.mask = (
+                        F.interpolate(frame_samples.mask.unsqueeze(1).float(), size=scale, mode="nearest")
+                        .squeeze(1)
+                        .bool()
+                    )
 
     def on_train_epoch_start(self) -> None:
         """Reset the accumulated box normalizer at the start of every training epoch.
@@ -195,6 +203,8 @@ class RFDETRModelModule(LightningModule):
             detached postprocessed predictions for train mAP logging.
         """
         samples, targets = batch
+        if self.model_config.tracking.enabled and isinstance(samples, (tuple, list)):
+            return self._training_step_tracking(samples, targets, batch_idx)
         batch_size = len(targets)
         outputs = self.model(samples, targets)
         if self._use_manual_optimization:
@@ -271,6 +281,169 @@ class RFDETRModelModule(LightningModule):
                 "targets": targets,
             }
         return loss_for_return.detach() if self._use_manual_optimization else loss_for_return
+
+    @staticmethod
+    def _tracking_outputs(frame: TrackingFrameOutput) -> dict[str, Any]:
+        """Convert a structured tracking frame into the existing criterion contract."""
+        outputs: dict[str, Any] = {
+            "pred_logits": frame.pred_logits,
+            "pred_boxes": frame.pred_boxes,
+        }
+        if frame.aux_outputs:
+            outputs["aux_outputs"] = list(frame.aux_outputs)
+        if frame.enc_outputs is not None:
+            outputs["enc_outputs"] = frame.enc_outputs
+        return outputs
+
+    def _commit_tracking_state(
+        self,
+        frame: TrackingFrameOutput,
+        assignments: list[SequenceAssignment],
+        prior_state: TrackQueryState | None,
+        prior_track_ids: list[tuple[int | None, ...]],
+        *,
+        inference_like: bool,
+    ) -> tuple[TrackQueryState, list[tuple[int | None, ...]]]:
+        """Commit predicted candidate tensors under the configured clip lifecycle.
+
+        Ground-truth assignments establish slot identity, but the recurrent tensors always come from model predictions.
+        In inference-like mode, prediction confidence additionally gates activation and continuation. Weak persistent
+        slots preserve their preceding trusted tensors.
+        """
+        candidate = frame.candidate_state
+        features = candidate.query_features.clone()
+        boxes = candidate.reference_boxes.clone()
+        next_ids: list[tuple[int | None, ...]] = []
+        active_masks: list[torch.Tensor] = []
+        scores = frame.pred_logits.sigmoid().amax(dim=-1)
+        capacity = self.model_config.tracking.active_capacity(self.model_config.num_queries)
+        lifecycle = TrackingSessionConfig()
+
+        for batch_index, (assignment, old_ids) in enumerate(zip(assignments, prior_track_ids, strict=True)):
+            committed_ids = list(old_ids)
+            visible_queries = set(assignment.decoder_indices[0].tolist())
+            discovery_pairs = zip(
+                assignment.discovery_indices[0].tolist(), assignment.discovery_indices[1].tolist(), strict=True
+            )
+            target_ids = list(assignment.slot_track_ids)
+
+            for query_index in range(len(old_ids)):
+                if old_ids[query_index] is not None and query_index not in visible_queries and prior_state is not None:
+                    features[batch_index, query_index] = prior_state.query_features[batch_index, query_index]
+                    boxes[batch_index, query_index] = prior_state.reference_boxes[batch_index, query_index]
+
+            for query_index, _ in discovery_pairs:
+                proposed_id = target_ids[query_index]
+                can_activate = proposed_id is not None and sum(value is not None for value in committed_ids) < capacity
+                if inference_like:
+                    can_activate = can_activate and bool(
+                        scores[batch_index, query_index] >= lifecycle.activation_threshold
+                    )
+                if can_activate:
+                    committed_ids[query_index] = proposed_id
+
+            if inference_like and prior_state is not None:
+                for query_index, track_id in enumerate(old_ids):
+                    if track_id is None or query_index not in visible_queries:
+                        continue
+                    if scores[batch_index, query_index] < lifecycle.continuation_threshold:
+                        features[batch_index, query_index] = prior_state.query_features[batch_index, query_index]
+                        boxes[batch_index, query_index] = prior_state.reference_boxes[batch_index, query_index]
+
+            next_ids.append(tuple(committed_ids))
+            active_masks.append(torch.tensor([value is not None for value in committed_ids], device=scores.device))
+
+        state = TrackQueryState(features, boxes, torch.stack(active_masks).bool())
+        if self.train_config.tracking.detach_state_between_frames:
+            state = TrackQueryState(
+                state.query_features.detach(),
+                state.reference_boxes.detach(),
+                state.active_mask,
+            )
+        return state, next_ids
+
+    def _unroll_tracking_clip(
+        self,
+        frame_batches: tuple | list,
+        target_batches: tuple | list,
+        *,
+        inference_like: bool,
+        compute_losses: bool = True,
+    ) -> tuple[dict[str, torch.Tensor], list[tuple[dict[str, Any], tuple]]]:
+        """Causally unroll one time-major clip and return frame-mean losses and outputs."""
+        if len(frame_batches) != len(target_batches) or not frame_batches:
+            raise ValueError("tracking frame and target batches must have the same nonzero clip length")
+        if len(frame_batches) != self.train_config.tracking.clip_length:
+            raise ValueError(
+                f"received clip length {len(frame_batches)}, expected {self.train_config.tracking.clip_length}"
+            )
+
+        batch_size = len(target_batches[0])
+        slot_track_ids = [tuple(None for _ in range(self.model_config.num_queries)) for _ in range(batch_size)]
+        first_tensors = frame_batches[0].tensors
+        state: TrackQueryState | None = TrackQueryState.empty(
+            batch_size=batch_size,
+            num_queries=self.model_config.num_queries,
+            hidden_dim=self.model_config.hidden_dim,
+            device=first_tensors.device,
+            dtype=first_tensors.dtype,
+        )
+        frame_losses: list[dict[str, torch.Tensor]] = []
+        frame_outputs: list[tuple[dict[str, Any], tuple]] = []
+        for samples, targets in zip(frame_batches, target_batches, strict=True):
+            if len(targets) != batch_size:
+                raise ValueError("every sequence time step must have the same batch size")
+            frame = self.model.forward_tracking(samples, state)
+            outputs = self._tracking_outputs(frame)
+            assignments = identity_aware_sequence_assignment(
+                self.criterion.matcher, outputs, list(targets), slot_track_ids
+            )
+            if compute_losses:
+                frame_losses.append(self.criterion(outputs, list(targets), assignments))
+            state, slot_track_ids = self._commit_tracking_state(
+                frame,
+                assignments,
+                state,
+                slot_track_ids,
+                inference_like=inference_like,
+            )
+            frame_outputs.append((outputs, targets))
+
+        loss_names = set().union(*(losses.keys() for losses in frame_losses)) if frame_losses else set()
+        mean_losses = {
+            name: torch.stack([losses[name] for losses in frame_losses if name in losses]).mean() for name in loss_names
+        }
+        return mean_losses, frame_outputs
+
+    def _training_step_tracking(
+        self, frame_batches: tuple | list, target_batches: tuple | list, batch_idx: int
+    ) -> torch.Tensor:
+        """Run one causal video-training step with clip-local recurrent state."""
+        loss_dict, _ = self._unroll_tracking_clip(
+            frame_batches,
+            target_batches,
+            inference_like=self.train_config.tracking.lifecycle_mode == "inference_like",
+        )
+        weight_dict = self.criterion.weight_dict
+        loss = sum(loss_dict[name] * weight_dict[name] for name in loss_dict if name in weight_dict)
+        batch_size = len(target_batches[0])
+        self.log_dict(
+            {f"train/{name}": value for name, value in loss_dict.items()},
+            on_step=self.train_config.train_log_on_step,
+            on_epoch=True,
+            sync_dist=self.train_config.train_log_sync_dist,
+            batch_size=batch_size,
+        )
+        self.log(
+            "train/loss",
+            loss,
+            on_step=self.train_config.train_log_on_step,
+            on_epoch=True,
+            sync_dist=self.train_config.train_log_sync_dist,
+            batch_size=batch_size,
+        )
+        self._log_train_progress_metrics(loss, loss_dict, batch_size=batch_size)
+        return loss / max(1, int(self.trainer.accumulate_grad_batches))
 
     def _compute_train_losses(
         self,
@@ -500,6 +673,24 @@ class RFDETRModelModule(LightningModule):
             Dict with ``results`` (postprocessed predictions) and ``targets``.
         """
         samples, targets = batch
+        if self.model_config.tracking.enabled and isinstance(samples, (tuple, list)):
+            loss_dict, frame_outputs = self._unroll_tracking_clip(
+                samples,
+                targets,
+                inference_like=True,
+                compute_losses=self.train_config.compute_val_loss,
+            )
+            if self.train_config.compute_val_loss:
+                weight_dict = self.criterion.weight_dict
+                loss = sum(loss_dict[name] * weight_dict[name] for name in loss_dict if name in weight_dict)
+                self._log_val_loss_metrics(loss, loss_dict, batch_size=len(targets[0]))
+            results: list[dict[str, torch.Tensor]] = []
+            flat_targets: list[dict[str, torch.Tensor]] = []
+            for outputs, frame_targets in frame_outputs:
+                orig_sizes = torch.stack([target["orig_size"] for target in frame_targets])
+                results.extend(self.postprocess(outputs, orig_sizes))
+                flat_targets.extend(frame_targets)
+            return {"results": results, "targets": flat_targets}
         outputs = self.model(samples)
         if self.train_config.compute_val_loss:
             loss_dict = self.criterion(outputs, targets)

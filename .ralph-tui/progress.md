@@ -29,6 +29,8 @@ after each iteration and it's included in prompts for context.
   matcher on the residual target/discovery-slot subproblem; unknown identities remain non-persistent.
 - Tracking criteria reuse one precomputed sequence assignment for the final and every auxiliary decoder layer; encoder
   proposal losses remain frame-local and use the ordinary matcher, while unmatched absent slots are classification-only.
+- Recurrent Lightning steps consume time-major frame batches, create state per clip, average already-normalized frame
+  losses, and commit predicted candidate tensors under assignment-guided or confidence-gated lifecycle policy.
 
 ---
 
@@ -242,4 +244,26 @@ after each iteration and it's included in prompts for context.
   - The dependency-isolated focused criterion suite passes (12 tests). Ordinary collection remains blocked by the host
     Transformers package lacking `BackboneConfigMixin`; Python compilation, Ruff lint/format, and `git diff --check`
     pass, while `uv` cannot use its read-only global cache.
+---
+
+## 2026-07-27 - US-013
+- Added causal time-major clip unrolling to Lightning training and validation, with an explicit empty state at each clip
+  boundary, per-frame identity-aware assignment, frame-mean loss aggregation, and flattened validation postprocessing.
+- Carried predicted decoder features and boxes between frames, preserved trusted state for absent/weak continuations,
+  supported explicit temporal detachment, and made validation use inference-like confidence gating.
+- Selected `TrackingSetCriterion` for tracking-enabled builds and replayed one multi-scale resize across every frame in a
+  clip while leaving ordinary image steps unchanged.
+- Files changed: `src/rfdetr/training/module_model.py`, `src/rfdetr/models/lwdetr.py`,
+  `tests/training/test_module_model.py`, `tests/models/test_builders.py`, `.ralph-tui/progress.md`.
+- **Learnings:**
+  - A clip recurrent state must be a local variable initialized explicitly from the first time-major batch; using model
+    or Lightning-module attributes would leak graphs and identities across independent clips.
+  - Assignment-guided lifecycle still carries model-predicted features and boxes: ground truth controls only slot role
+    and identity, while absent slots preserve the preceding trusted prediction.
+  - The transitional builder namespace deliberately omits nested capability configs, so the tracking criterion switch
+    belongs in `build_criterion_from_config` rather than the shared namespace compatibility surface.
+  - Focused pytest remains blocked by the host environment: the global Transformers lacks its public backbone exports,
+    `deprecate` is absent, and the training environment lacks `pytorch_lightning`; the checked-in `.venv` also lacks
+    pytest. Python compilation, Ruff lint/format, and `git diff --check` pass; `pre-commit` and typecheck tools are not
+    installed.
 ---
