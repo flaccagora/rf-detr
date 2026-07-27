@@ -11,7 +11,38 @@ after each iteration and it's included in prompts for context.
   workers consume normalized records without rejoining or reinterpreting raw annotation JSON.
 - Sequence augmentation should decompose existing detection pipelines by stage: replay declared geometric randomness
   across frames, while allowing declared pixel-level transforms to draw independently.
+- Keep one complete clip behind each video-dataset index; ordinary DataLoader samplers, distributed sharding, batch
+  sizing, and gradient-accumulation alignment then operate in clip units without temporal sampler special cases.
 
+---
+
+## 2026-07-27 - US-004
+- Selected `make_sequence_collate_fn` at the DataModule boundary only when `dataset_file="video"`; all image datasets
+  retain the existing ordinary image collator and loader behavior.
+- Kept sampling, replacement sampling, distributed alignment, batch size, and gradient accumulation unchanged because
+  each sequence-dataset item is already one complete clip; video batches now expose chronological time-major image and
+  target tuples.
+- Added behavioral coverage for complete-clip training batches and deterministic multi-worker validation ordering that
+  cannot mix clip membership across time steps.
+- Files changed: `src/rfdetr/training/module_data.py`, `tests/training/test_module_data.py`,
+  `.ralph-tui/progress.md`.
+- Verification:
+  - `UV_CACHE_DIR=/tmp/rfdetr-uv-cache uv run --no-sync pytest -q tests/training/test_module_data.py -k
+    video_batch_is_time_major_and_keeps_complete_clips` — blocked during collection because the host Transformers
+    installation lacks `BackboneConfigMixin`.
+  - `HF_HOME=/tmp/clevis-hf docker compose run --rm -v
+    "$PWD/submodules/rf-detr:/app/submodules/rf-detr:ro" clevis -lc 'python -m pip install -q pytest pytest-timeout
+    pytest-doctestplus && cd /app/submodules/rf-detr && PYTHONPATH=src python -m pytest -q
+    tests/training/test_module_data.py tests/datasets/test_video.py'` (from Clevis root) — blocked because access to
+    `/var/run/docker.sock` was denied.
+  - `pre-commit run --all-files` — unavailable (`pre-commit: command not found`).
+  - `ruff check src/rfdetr/training/module_data.py tests/training/test_module_data.py`, focused
+    `ruff format --check`, `python -m compileall`, and `git diff --check` — passed.
+- **Learnings:**
+  - Treating clips as dataset samples lets PyTorch's existing samplers and Lightning's distributed sampler injection
+    shard complete temporal units; only collation needs to become sequence-aware.
+  - DataLoader worker prefetch preserves sampler order, so a sequential validation sampler plus clip-atomic
+    `__getitem__` maintains deterministic frame and sequence boundaries without worker-specific sequencing logic.
 ---
 
 ## 2026-07-27 - US-003

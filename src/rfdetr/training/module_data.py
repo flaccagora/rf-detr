@@ -15,7 +15,7 @@ from torch.utils.data import DataLoader
 
 from rfdetr._namespace import _namespace_from_configs
 from rfdetr.config import ModelConfig, TrainConfig
-from rfdetr.datasets import build_dataset
+from rfdetr.datasets import build_dataset, make_sequence_collate_fn
 from rfdetr.datasets.aug_configs import AUG_CONFIG
 from rfdetr.utilities.box_ops import box_xyxy_to_cxcywh
 from rfdetr.utilities.logger import get_logger
@@ -182,9 +182,8 @@ class RFDETRDataModule(LightningDataModule):
                 f"{block_size} from patch_size={model_config.patch_size} "
                 f"and num_windows={model_config.num_windows}."
             )
-        self._collate_fn = make_collate_fn(
-            block_size=block_size,
-        )
+        collate_factory = make_sequence_collate_fn if train_config.dataset_file == "video" else make_collate_fn
+        self._collate_fn = collate_factory(block_size=block_size)
 
         self._dataset_train: torch.utils.data.Dataset | None = None
         self._dataset_val: torch.utils.data.Dataset | None = None

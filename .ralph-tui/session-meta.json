@@ -2,14 +2,14 @@
   "id": "f316a568-6174-40ad-ba2c-959652f8fa66",
   "status": "running",
   "startedAt": "2026-07-27T09:18:34.209Z",
-  "updatedAt": "2026-07-27T09:28:46.801Z",
+  "updatedAt": "2026-07-27T09:33:12.267Z",
   "agentPlugin": "codex",
   "trackerPlugin": "json",
   "executionScopes": [],
   "prdPath": "/home/flaccagora/Desktop/clevis/submodules/rf-detr/tasks/video-sequence-training.json",
-  "currentIteration": 2,
+  "currentIteration": 3,
   "maxIterations": 0,
   "totalTasks": 0,
-  "tasksCompleted": 2,
+  "tasksCompleted": 3,
   "cwd": "/home/flaccagora/Desktop/clevis/submodules/rf-detr"
 }

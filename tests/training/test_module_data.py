@@ -15,7 +15,7 @@ import torch
 import torch.utils.data
 from torch.utils.data import DataLoader
 
-from rfdetr.config import RFDETRBaseConfig, TrainConfig
+from rfdetr.config import RFDETRBaseConfig, TrackingConfig, TrackingTrainConfig, TrainConfig
 from rfdetr.utilities.tensors import NestedTensor
 
 # ---------------------------------------------------------------------------
@@ -106,6 +106,24 @@ class _VisualDataset(torch.utils.data.Dataset):
                 "size": torch.tensor([16, 16], dtype=torch.int64),
             },
         )
+
+
+class _SequenceDataset(torch.utils.data.Dataset):
+    """Deterministic clip dataset for sequence DataLoader contract tests."""
+
+    def __init__(self, length: int = 12, clip_length: int = 3) -> None:
+        self._length = length
+        self._clip_length = clip_length
+
+    def __len__(self) -> int:
+        """Return the number of complete clips."""
+        return self._length
+
+    def __getitem__(self, idx: int) -> tuple[tuple[torch.Tensor, ...], tuple[dict[str, int], ...]]:
+        """Return one chronological clip whose metadata identifies its boundary."""
+        images = tuple(torch.full((3, 8, 8), idx * 10 + time, dtype=torch.float32) for time in range(self._clip_length))
+        targets = tuple({"sequence_id": idx, "frame_index": time} for time in range(self._clip_length))
+        return images, targets
 
 
 def _make_batch(batch_size: int = 2, channels: int = 3, h: int = 16, w: int = 16):
@@ -568,6 +586,33 @@ class TestTrainDataloader:
         loader = dm.train_dataloader()
         assert isinstance(loader, DataLoader)
 
+    def test_video_batch_is_time_major_and_keeps_complete_clips(self, tmp_path):
+        """Video sampling batches complete clips and collates them along the outer time dimension."""
+        mc = _base_model_config(group_detr=1, tracking=TrackingConfig(enabled=True))
+        tc = _base_train_config(
+            tmp_path,
+            dataset_file="video",
+            batch_size=2,
+            tracking=TrackingTrainConfig(clip_length=3),
+        )
+        from rfdetr.training.module_data import RFDETRDataModule
+
+        dm = RFDETRDataModule(mc, tc)
+        dm._dataset_train = _SequenceDataset()
+
+        frame_batches, target_batches = next(iter(dm.train_dataloader()))
+
+        assert len(frame_batches) == len(target_batches) == 3
+        sequence_ids = [target["sequence_id"] for target in target_batches[0]]
+        assert all(
+            [target["sequence_id"] for target in time_targets] == sequence_ids for time_targets in target_batches
+        )
+        assert [[target["frame_index"] for target in time_targets] for time_targets in target_batches] == [
+            [0, 0],
+            [1, 1],
+            [2, 2],
+        ]
+
     def test_large_dataset_uses_batch_sampler(self, tmp_path):
         """A large dataset uses a BatchSampler (drop_last=True, no replacement)."""
         # 200 samples > 2*1*5=10 threshold → large path
@@ -778,6 +823,39 @@ class TestValDataloader:
         dm = self._setup_dm_with_val(tmp_path)
         loader = dm.val_dataloader()
         assert isinstance(loader, DataLoader)
+
+    def test_video_workers_preserve_clip_and_frame_order(self, tmp_path):
+        """Worker-prefetched validation clips remain sequential and never mix frame boundaries."""
+        mc = _base_model_config(group_detr=1, tracking=TrackingConfig(enabled=True))
+        tc = _base_train_config(
+            tmp_path,
+            dataset_file="video",
+            batch_size=2,
+            num_workers=2,
+            persistent_workers=False,
+            tracking=TrackingTrainConfig(clip_length=3),
+        )
+        from rfdetr.training.module_data import RFDETRDataModule
+
+        dm = RFDETRDataModule(mc, tc)
+        dm._dataset_val = _SequenceDataset(length=4)
+
+        batches = list(dm.val_dataloader())
+
+        assert [[target["sequence_id"] for target in target_batches[0]] for _, target_batches in batches] == [
+            [0, 1],
+            [2, 3],
+        ]
+        for _, target_batches in batches:
+            sequence_ids = [target["sequence_id"] for target in target_batches[0]]
+            assert all(
+                [target["sequence_id"] for target in time_targets] == sequence_ids for time_targets in target_batches
+            )
+            assert [[target["frame_index"] for target in time_targets] for time_targets in target_batches] == [
+                [0, 0],
+                [1, 1],
+                [2, 2],
+            ]
 
     def test_uses_sequential_sampler(self, tmp_path):
         """val_dataloader uses a SequentialSampler."""
