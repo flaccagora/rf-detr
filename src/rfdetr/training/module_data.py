@@ -169,6 +169,7 @@ class RFDETRDataModule(LightningDataModule):
         super().__init__()
         self.model_config = model_config
         self.train_config = train_config
+        train_config.validate_for_model(model_config)
 
         # Backbone divisibility requirement: inputs with windowed attention must
         # have H and W divisible by patch_size * num_windows. The collate_fn

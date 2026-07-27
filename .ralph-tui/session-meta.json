@@ -1,15 +1,15 @@
 {
-  "id": "9698fa22-85a0-42b8-bc8a-660d298fb847",
+  "id": "f316a568-6174-40ad-ba2c-959652f8fa66",
   "status": "running",
-  "startedAt": "2026-07-26T22:30:55.395Z",
-  "updatedAt": "2026-07-27T04:53:43.279Z",
+  "startedAt": "2026-07-27T09:18:34.209Z",
+  "updatedAt": "2026-07-27T09:18:34.209Z",
   "agentPlugin": "codex",
   "trackerPlugin": "json",
   "executionScopes": [],
-  "prdPath": "/home/flaccagora/Desktop/clevis/submodules/rf-detr/tasks/persistent-track-queries.json",
-  "currentIteration": 14,
-  "maxIterations": 21,
+  "prdPath": "/home/flaccagora/Desktop/clevis/submodules/rf-detr/tasks/video-sequence-training.json",
+  "currentIteration": 0,
+  "maxIterations": 0,
   "totalTasks": 0,
-  "tasksCompleted": 14,
+  "tasksCompleted": 0,
   "cwd": "/home/flaccagora/Desktop/clevis/submodules/rf-detr"
 }

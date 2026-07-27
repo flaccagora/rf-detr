@@ -3,7 +3,7 @@
   "sessionId": "f316a568-6174-40ad-ba2c-959652f8fa66",
   "status": "running",
   "startedAt": "2026-07-27T09:18:34.243Z",
-  "updatedAt": "2026-07-27T09:19:33.804Z",
+  "updatedAt": "2026-07-27T09:24:58.370Z",
   "currentIteration": 0,
   "maxIterations": 0,
   "tasksCompleted": 0,
@@ -62,8 +62,6 @@
   "iterations": [],
   "skippedTaskIds": [],
   "cwd": "/home/flaccagora/Desktop/clevis/submodules/rf-detr",
-  "activeTaskIds": [
-    "US-001"
-  ],
+  "activeTaskIds": [],
   "subagentPanelVisible": false
 }

@@ -135,14 +135,27 @@ class TrackingTrainConfig(BaseConfig):
     Attributes:
         clip_length: Number of chronological frames in each training clip. A
             value of one preserves ordinary image-training behavior.
+        clip_stride: Number of source frames between adjacent clip starts.
+        annotation_path: Dataset-relative or absolute COCO-video annotation
+            path. ``None`` lets the dataset adapter use its split convention.
         detach_state_between_frames: Whether recurrent query state is detached
             between adjacent frames.
         lifecycle_mode: Policy used to commit state while training.
     """
 
     clip_length: int = Field(default=1, ge=1)
+    clip_stride: int = Field(default=1, ge=1)
+    annotation_path: str | None = None
     detach_state_between_frames: bool = False
     lifecycle_mode: Literal["assignment_guided", "inference_like"] = "assignment_guided"
+
+    @field_validator("annotation_path", mode="before")
+    @classmethod
+    def _coerce_annotation_path(cls, value: PathLikeStr | None) -> str | None:
+        """Store annotation paths as strings for JSON and checkpoint serialization."""
+        if value is None:
+            return None
+        return os.fspath(value)
 
 
 class TrackingSessionConfig(BaseConfig):
@@ -840,7 +853,7 @@ class TrainConfig(BaseConfig):
     keypoint_visible_loss_coef: float = 0
     keypoint_nll_loss_coef: float = 0
     keypoint_oks_sigmas: list[float] | None = None
-    dataset_file: Literal["coco", "o365", "roboflow", "yolo"] = "roboflow"
+    dataset_file: Literal["coco", "o365", "roboflow", "video", "yolo"] = "roboflow"
     square_resize_div_64: bool = True
     dataset_dir: PathLikeStr | None
     output_dir: PathLikeStr = "output"
@@ -891,6 +904,44 @@ class TrainConfig(BaseConfig):
             "all other types are JSON-encoded."
         ),
     )
+
+    def validate_for_model(self, model_config: ModelConfig) -> None:
+        """Validate training settings that depend on architecture configuration.
+
+        Image datasets intentionally bypass these temporal-only restrictions.
+
+        Args:
+            model_config: Architecture paired with this training configuration.
+
+        Raises:
+            ValueError: If a video dataset is paired with an unsupported model
+                or first-version training option.
+        """
+        if self.dataset_file != "video":
+            return
+        if not model_config.tracking.enabled:
+            raise ValueError(
+                "Video training requires model_config.tracking.enabled=True. "
+                "Enable TrackingConfig on the architecture before loading a video dataset."
+            )
+        if model_config.group_detr != 1:
+            raise ValueError(
+                "Video training requires model_config.group_detr=1 because recurrent query slots cannot use "
+                "duplicate training groups."
+            )
+        if self.tracking.clip_length <= 1:
+            raise ValueError(
+                "Video training requires tracking.clip_length greater than one; configure at least two frames per clip."
+            )
+        if self.batch_size == "auto":
+            raise ValueError(
+                "Video training does not support batch_size='auto' in this version; set an explicit integer batch_size."
+            )
+        if self.augmentation_backend != "cpu":
+            raise ValueError(
+                "Video training requires augmentation_backend='cpu' in this version so spatial transforms can be "
+                "shared across clip frames."
+            )
 
     @model_validator(mode="after")
     def _warn_deprecated_train_config_fields(self) -> "TrainConfig":

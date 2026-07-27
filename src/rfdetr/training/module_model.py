@@ -53,6 +53,7 @@ class RFDETRModelModule(LightningModule):
         super().__init__()
         self.model_config = model_config
         self.train_config = train_config
+        train_config.validate_for_model(model_config)
         # Manual optimization is enabled only for keypoint models so that the box-count
         # normalizer can be accumulated across grad-accum microbatches. Detection and
         # segmentation use Lightning's automatic optimization (PTL handles accumulation,
