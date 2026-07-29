@@ -666,7 +666,10 @@ class LWDETR(nn.Module):
         output = self._forward(samples, prior_state=prior_state)
         candidate_state = TrackQueryState(
             query_features=output.pop("_tracking_query_features"),
-            reference_boxes=output["pred_boxes"],
+            # Reparameterized detection boxes may legitimately extend beyond
+            # the image for loss/postprocessing. Decoder recurrence, however,
+            # consumes normalized references and must stay in [0, 1].
+            reference_boxes=output["pred_boxes"].clamp(0.0, 1.0),
             active_mask=torch.ones_like(prior_state.active_mask),
         )
         aux_outputs = tuple(output.get("aux_outputs", ()))

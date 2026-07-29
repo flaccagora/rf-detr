@@ -160,13 +160,12 @@ class TrackingFrameOutput:
             raise ValueError("frame predictions, candidate_state, and input_active_mask must share a device")
         if not self.pred_logits.is_floating_point() or not self.pred_boxes.is_floating_point():
             raise TypeError("pred_logits and pred_boxes must use floating-point dtypes")
-        if self.pred_logits.dtype != self.candidate_state.query_features.dtype:
-            raise TypeError("pred_logits and candidate_state must have the same dtype")
         if self.pred_boxes.dtype != self.candidate_state.reference_boxes.dtype:
             raise TypeError("pred_boxes and candidate reference boxes must have the same dtype")
         if not torch.isfinite(self.pred_logits).all():
             raise ValueError("pred_logits must contain only finite values")
-        _validate_boxes(self.pred_boxes, name="pred_boxes")
+        if not torch.isfinite(self.pred_boxes).all():
+            raise ValueError("pred_boxes must contain only finite values")
 
 
 # Short form retained for callers that name the result after its frame scope.

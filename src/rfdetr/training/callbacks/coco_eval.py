@@ -381,18 +381,38 @@ class COCOEvalCallback(Callback):
         ema_cb = self._get_ema_callback(trainer)
         ema_inner = _get_ema_inner_module(ema_cb)
         if ema_cb is not None and ema_inner is not None and self.map_metric_ema is not None:
-            samples, _ = batch
-            orig_sizes = torch.stack([t["orig_size"] for t in outputs["targets"]]).to(pl_module.device)
+            samples, batch_targets = batch
             ema_underlying = ema_inner.model
             with torch.no_grad():
                 ema_underlying.eval()  # AveragedModel deepcopy is not managed by PTL
-                ema_outputs = ema_underlying(samples)
-                ema_results = pl_module.postprocess(ema_outputs, orig_sizes)
+                if isinstance(samples, (tuple, list)):
+                    _, ema_frame_outputs = pl_module._unroll_tracking_clip(
+                        samples,
+                        batch_targets,
+                        inference_like=True,
+                        compute_losses=False,
+                        tracking_model=ema_underlying,
+                    )
+                    ema_results = []
+                    ema_targets = []
+                    for ema_outputs, frame_targets in ema_frame_outputs:
+                        orig_sizes = torch.stack(
+                            [target["orig_size"] for target in frame_targets]
+                        ).to(pl_module.device)
+                        ema_results.extend(pl_module.postprocess(ema_outputs, orig_sizes))
+                        ema_targets.extend(frame_targets)
+                else:
+                    orig_sizes = torch.stack(
+                        [target["orig_size"] for target in outputs["targets"]]
+                    ).to(pl_module.device)
+                    ema_outputs = ema_underlying(samples)
+                    ema_results = pl_module.postprocess(ema_outputs, orig_sizes)
+                    ema_targets = outputs["targets"]
             ema_preds = self._convert_preds(ema_results)
             self.map_metric_ema.update(ema_preds, targets)
             self._update_keypoint_oks_metric(
                 trainer,
-                {"results": ema_results, "targets": outputs["targets"]},
+                {"results": ema_results, "targets": ema_targets},
                 split="val_ema",
             )
             self._ema_has_updates = True

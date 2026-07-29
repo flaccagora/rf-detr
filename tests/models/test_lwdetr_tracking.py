@@ -78,6 +78,39 @@ def test_forward_tracking_returns_aligned_predictions_and_candidate_state() -> N
     assert transformer.call_args.kwargs["prior_state"] is prior_state
 
 
+def test_forward_tracking_preserves_amp_logits_and_normalizes_recurrent_boxes() -> None:
+    model, _ = _make_tracking_model()
+    model.eval()
+    prior_state = TrackQueryState.empty(
+        batch_size=2,
+        num_queries=3,
+        hidden_dim=4,
+        dtype=torch.float32,
+    )
+    model._forward = MagicMock(
+        return_value={
+            "pred_logits": torch.zeros(2, 3, 5, dtype=torch.bfloat16),
+            "pred_boxes": torch.tensor(
+                [[[-0.1, 0.5, 1.2, 0.4]] * 3] * 2,
+                dtype=torch.float32,
+            ),
+            "_tracking_query_features": torch.zeros(2, 3, 4, dtype=torch.float32),
+        }
+    )
+
+    output = model.forward_tracking(torch.ones(2, 3, 8, 8), prior_state)
+
+    assert output.pred_logits.dtype == torch.bfloat16
+    assert output.candidate_state.query_features.dtype == torch.float32
+    assert torch.equal(
+        output.pred_boxes[0, 0], torch.tensor([-0.1, 0.5, 1.2, 0.4])
+    )
+    assert torch.equal(
+        output.candidate_state.reference_boxes[0, 0],
+        torch.tensor([0.0, 0.5, 1.0, 0.4]),
+    )
+
+
 def test_empty_tracking_state_matches_stateless_evaluation_predictions() -> None:
     """An omitted prior state preserves ordinary evaluation predictions."""
     model, transformer = _make_tracking_model()

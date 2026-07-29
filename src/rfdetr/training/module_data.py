@@ -696,7 +696,7 @@ class RFDETRDataModule(LightningDataModule):
         return None
 
     def transfer_batch_to_device(self, batch: tuple, device: torch.device, dataloader_idx: int) -> tuple:
-        """Move a ``(NestedTensor, targets)`` batch to *device*.
+        """Move an image or time-major video batch to *device*.
 
         PTL's default iterates tuple elements and calls ``.to(device)``; that works for plain tensors but
         ``NestedTensor`` must be moved explicitly.
@@ -711,6 +711,24 @@ class RFDETRDataModule(LightningDataModule):
         """
         samples, targets = batch
         non_blocking = device.type == "cuda"
-        samples = samples.to(device, non_blocking=non_blocking)
-        targets = [{k: v.to(device, non_blocking=non_blocking) for k, v in t.items()} for t in targets]
+
+        def move_targets(target_batch):
+            return type(target_batch)(
+                {
+                    key: (
+                        value.to(device, non_blocking=non_blocking)
+                        if isinstance(value, torch.Tensor)
+                        else value
+                    )
+                    for key, value in target.items()
+                }
+                for target in target_batch
+            )
+
+        if isinstance(samples, (tuple, list)):
+            samples = type(samples)(sample.to(device, non_blocking=non_blocking) for sample in samples)
+            targets = type(targets)(move_targets(target_batch) for target_batch in targets)
+        else:
+            samples = samples.to(device, non_blocking=non_blocking)
+            targets = move_targets(targets)
         return samples, targets

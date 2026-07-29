@@ -1309,6 +1309,49 @@ class TestEmaCollectiveSymmetry:
 
         assert cb.map_metric_ema is None
 
+    def test_video_validation_runs_ema_through_tracking_unroll(self) -> None:
+        ema_cb = _ema_callback()
+        ema_underlying = MagicMock(name="ema_tracking_model")
+        ema_cb._average_model = SimpleNamespace(
+            module=SimpleNamespace(model=ema_underlying)
+        )
+        trainer = _make_trainer(callbacks=[ema_cb])
+        module = _cpu_module()
+        module.postprocess.side_effect = [_detection_preds(0), _detection_preds(0)]
+        frame_targets = (tuple(_detection_targets()), tuple(_detection_targets()))
+        module._unroll_tracking_clip.return_value = (
+            {},
+            [({"pred_logits": torch.empty(0)}, targets) for targets in frame_targets],
+        )
+        cb = COCOEvalCallback()
+        cb.setup(trainer, module, stage="fit")
+        cb.map_metric = MagicMock(name="map_metric")
+        cb.map_metric_ema = MagicMock(name="map_metric_ema")
+        outputs = {
+            "results": _detection_preds(0) + _detection_preds(0),
+            "targets": list(frame_targets[0] + frame_targets[1]),
+        }
+        samples = (MagicMock(name="frame_0"), MagicMock(name="frame_1"))
+
+        cb.on_validation_batch_end(
+            trainer,
+            module,
+            outputs,
+            (samples, frame_targets),
+            batch_idx=0,
+        )
+
+        module._unroll_tracking_clip.assert_called_once_with(
+            samples,
+            frame_targets,
+            inference_like=True,
+            compute_losses=False,
+            tracking_model=ema_underlying,
+        )
+        ema_underlying.assert_not_called()
+        assert module.postprocess.call_count == 2
+        cb.map_metric_ema.update.assert_called_once()
+
     def test_should_compute_ema_false_when_metric_has_no_updates(self) -> None:
         """A rank whose EMA metric saw no updates votes against computing (avoids empty-state divergence)."""
         cb = COCOEvalCallback()

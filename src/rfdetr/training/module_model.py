@@ -370,6 +370,7 @@ class RFDETRModelModule(LightningModule):
         *,
         inference_like: bool,
         compute_losses: bool = True,
+        tracking_model: Any | None = None,
     ) -> tuple[dict[str, torch.Tensor], list[tuple[dict[str, Any], tuple]]]:
         """Causally unroll one time-major clip and return frame-mean losses and outputs."""
         if len(frame_batches) != len(target_batches) or not frame_batches:
@@ -391,10 +392,11 @@ class RFDETRModelModule(LightningModule):
         )
         frame_losses: list[dict[str, torch.Tensor]] = []
         frame_outputs: list[tuple[dict[str, Any], tuple]] = []
+        active_model = self.model if tracking_model is None else tracking_model
         for samples, targets in zip(frame_batches, target_batches, strict=True):
             if len(targets) != batch_size:
                 raise ValueError("every sequence time step must have the same batch size")
-            frame = self.model.forward_tracking(samples, state)
+            frame = active_model.forward_tracking(samples, state)
             outputs = self._tracking_outputs(frame)
             assignments = identity_aware_sequence_assignment(
                 self.criterion.matcher, outputs, list(targets), slot_track_ids

@@ -110,3 +110,18 @@ class TestTrackingFrameOutput:
                 candidate_state=TrackQueryState.empty(batch_size=1, num_queries=2, hidden_dim=4),
                 input_active_mask=torch.zeros(1, 3, dtype=torch.bool),
             )
+
+    def test_frame_output_allows_amp_logits_and_raw_reparameterized_boxes(self) -> None:
+        output = TrackingFrameOutput(
+            pred_logits=torch.zeros(1, 2, 3, dtype=torch.bfloat16),
+            pred_boxes=torch.tensor([[[-0.1, 0.5, 1.2, 0.4]] * 2]),
+            candidate_state=TrackQueryState(
+                query_features=torch.zeros(1, 2, 4),
+                reference_boxes=torch.tensor([[[0.0, 0.5, 1.0, 0.4]] * 2]),
+                active_mask=torch.ones(1, 2, dtype=torch.bool),
+            ),
+            input_active_mask=torch.zeros(1, 2, dtype=torch.bool),
+        )
+
+        assert output.pred_logits.dtype == torch.bfloat16
+        assert output.pred_boxes[0, 0, 0] < 0

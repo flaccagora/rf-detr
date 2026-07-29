@@ -11,8 +11,30 @@ from typing import Any
 import pytest
 
 from rfdetr._namespace import _namespace_from_configs
-from rfdetr.config import RFDETRBaseConfig, RFDETRSegNanoConfig, SegmentationTrainConfig, TrainConfig
+from rfdetr.config import (
+    RFDETRBaseConfig,
+    RFDETRSegNanoConfig,
+    SegmentationTrainConfig,
+    TrackingTrainConfig,
+    TrainConfig,
+)
 from rfdetr.models._types import BuilderArgs
+
+
+def test_tracking_train_config_preserves_attribute_access() -> None:
+    tracking = TrackingTrainConfig(
+        annotation_path="tracking/annotations.json",
+        clip_length=4,
+        clip_stride=2,
+    )
+
+    namespace = _namespace_from_configs(
+        RFDETRBaseConfig(), TrainConfig(dataset_dir="/tmp", tracking=tracking)
+    )
+
+    assert namespace.tracking.annotation_path == "tracking/annotations.json"
+    assert namespace.tracking.clip_length == 4
+    assert namespace.tracking.clip_stride == 2
 
 
 class TestNamespaceForwarding:

@@ -160,6 +160,9 @@ def _namespace_from_configs(
             # ModelConfig: wins over tc for overlapping architecture params
             # (group_detr, ia_bce_loss, segmentation_head, num_select).
             **mc.model_dump(include=set(_MC_NAMESPACE_FIELDS)),
+            # Dataset builders still consume tracking settings through attribute
+            # access, so preserve the validated nested config object.
+            "tracking": tc.tracking,
             # Segmentation extras (SegmentationTrainConfig only — absent from base TrainConfig).
             "mask_ce_loss_coef": getattr(tc, "mask_ce_loss_coef", 5.0),
             "mask_dice_loss_coef": getattr(tc, "mask_dice_loss_coef", 5.0),

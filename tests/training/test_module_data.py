@@ -1105,6 +1105,30 @@ class TestTransferBatchToDevice:
 
         assert isinstance(result_samples, NestedTensor)
 
+    def test_transfers_time_major_video_batch_and_preserves_metadata(
+        self, build_datamodule
+    ):
+        dm = build_datamodule()
+        first_samples, first_targets = _make_batch()
+        second_samples, second_targets = _make_batch()
+        first_targets[0]["sequence_id"] = "sample-a"
+        first_targets[0]["frame_index"] = 7
+        batch = (
+            (first_samples, second_samples),
+            (tuple(first_targets), tuple(second_targets)),
+        )
+
+        samples, targets = dm.transfer_batch_to_device(
+            batch, torch.device("cpu"), dataloader_idx=0
+        )
+
+        assert isinstance(samples, tuple)
+        assert all(isinstance(frame_batch, NestedTensor) for frame_batch in samples)
+        assert all(frame_batch.tensors.device.type == "cpu" for frame_batch in samples)
+        assert targets[0][0]["boxes"].device.type == "cpu"
+        assert targets[0][0]["sequence_id"] == "sample-a"
+        assert targets[0][0]["frame_index"] == 7
+
 
 # ---------------------------------------------------------------------------
 # TestBackendResolution — validates augmentation_backend logic in setup("fit")
