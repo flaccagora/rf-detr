@@ -39,6 +39,71 @@ from rfdetr.datasets.video import sequence_collate_fn as sequence_collate_fn
 from rfdetr.datasets.yolo import YoloDetection, build_roboflow_from_yolo
 
 
+def _video_split_annotations(
+    annotations: dict[str, Any],
+    image_set: str,
+    *,
+    annotation_path: Path,
+    dataset_root: Path,
+) -> dict[str, Any]:
+    """Select one split from a shared COCO-video annotation artifact.
+
+    New artifacts carry ``split`` on every image.  Older Clevis exports keep
+    the video-to-split mapping in the adjacent ``manifest.json``; support that
+    representation as well so existing datasets do not need rebuilding.
+    """
+    images = annotations.get("images")
+    objects = annotations.get("annotations")
+    if not isinstance(images, list) or not isinstance(objects, list):
+        return annotations
+
+    requested = "val" if image_set == "valid" else image_set
+    explicit = [image.get("split") for image in images if isinstance(image, dict)]
+    has_explicit_split = bool(explicit) and all(isinstance(value, str) for value in explicit)
+
+    split_map: dict[str, str] = {}
+    if not has_explicit_split:
+        manifest_candidates = (annotation_path.parent / "manifest.json", dataset_root / "manifest.json")
+        for manifest_path in dict.fromkeys(manifest_candidates):
+            if not manifest_path.is_file():
+                continue
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            candidate = manifest.get("splits") if isinstance(manifest, dict) else None
+            if isinstance(candidate, dict) and all(
+                isinstance(key, str) and isinstance(value, str) for key, value in candidate.items()
+            ):
+                split_map = candidate
+                break
+
+    def image_split(image: dict[str, Any]) -> str | None:
+        value = image.get("split")
+        if isinstance(value, str):
+            return "val" if value == "valid" else value
+        lineage = image.get("source_lineage")
+        video_id = lineage.get("video_id") if isinstance(lineage, dict) else None
+        value = split_map.get(video_id) if isinstance(video_id, str) else None
+        return "val" if value == "valid" else value
+
+    if not has_explicit_split and not split_map:
+        return annotations
+
+    selected_images = [
+        image for image in images if isinstance(image, dict) and image_split(image) == requested
+    ]
+    selected_ids = {image.get("id") for image in selected_images}
+    selected = dict(annotations)
+    selected["images"] = selected_images
+    selected["annotations"] = [
+        annotation
+        for annotation in objects
+        if isinstance(annotation, dict) and annotation.get("image_id") in selected_ids
+    ]
+    return selected
+
+
 def get_coco_api_from_dataset(dataset: Dataset[Any]) -> Any | None:
     for _ in range(10):
         if isinstance(dataset, Subset):
@@ -132,6 +197,12 @@ def build_video(image_set: str, args: Any, resolution: int) -> VideoSequenceData
         annotations = json.load(annotation_file)
     if not isinstance(annotations, dict):
         raise ValueError(f"video annotation file {annotation_path} must contain a JSON object")
+    annotations = _video_split_annotations(
+        annotations,
+        image_set,
+        annotation_path=annotation_path,
+        dataset_root=root,
+    )
 
     clip_length = args.tracking.clip_length
     clips = (

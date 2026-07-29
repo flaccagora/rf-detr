@@ -213,6 +213,60 @@ def test_public_dataset_factory_builds_on_disk_video_splits(tmp_path: Path) -> N
     assert all(isinstance(image, torch.Tensor) for image in images)
 
 
+def test_shared_video_annotations_are_filtered_by_explicit_image_split(tmp_path: Path) -> None:
+    annotations = _annotations()
+    for image in annotations["images"]:
+        image["split"] = "train" if image["sequence_id"] == "case-a" else "val"
+        Image.new("RGB", (image["width"], image["height"])).save(tmp_path / image["file_name"])
+    annotation_path = tmp_path / "annotations.json"
+    annotation_path.write_text(json.dumps(annotations), encoding="utf-8")
+    args = SimpleNamespace(
+        dataset_file="video",
+        dataset_dir=str(tmp_path),
+        tracking=SimpleNamespace(clip_length=2, clip_stride=1, annotation_path=str(annotation_path)),
+        multi_scale=False,
+        expanded_scales=False,
+        do_random_resize_via_padding=False,
+        patch_size=4,
+        num_windows=1,
+        aug_config=None,
+    )
+
+    train_dataset = build_dataset("train", args, resolution=8)
+    val_dataset = build_dataset("val", args, resolution=8)
+
+    assert [clip.image_ids for clip in train_dataset.clips] == [(10, 11)]
+    assert [clip.image_ids for clip in val_dataset.clips] == [(31, 30)]
+
+
+def test_shared_video_annotations_use_legacy_manifest_splits(tmp_path: Path) -> None:
+    annotations = _annotations()
+    for image in annotations["images"]:
+        video_id = "video-train" if image["sequence_id"] == "case-a" else "video-val"
+        image["source_lineage"] = {"video_id": video_id}
+        Image.new("RGB", (image["width"], image["height"])).save(tmp_path / image["file_name"])
+    annotation_path = tmp_path / "annotations.json"
+    annotation_path.write_text(json.dumps(annotations), encoding="utf-8")
+    (tmp_path / "manifest.json").write_text(
+        json.dumps({"splits": {"video-train": "train", "video-val": "val"}}),
+        encoding="utf-8",
+    )
+    args = SimpleNamespace(
+        dataset_file="video",
+        dataset_dir=str(tmp_path),
+        tracking=SimpleNamespace(clip_length=2, clip_stride=1, annotation_path=str(annotation_path)),
+        multi_scale=False,
+        expanded_scales=False,
+        do_random_resize_via_padding=False,
+        patch_size=4,
+        num_windows=1,
+        aug_config=None,
+    )
+
+    assert [clip.image_ids for clip in build_dataset("train", args, resolution=8).clips] == [(10, 11)]
+    assert [clip.image_ids for clip in build_dataset("val", args, resolution=8).clips] == [(31, 30)]
+
+
 def test_video_dataset_loads_a_chronological_clip_with_aligned_targets(tmp_path: Path) -> None:
     """A dataset item loads index-selected paths and preserves all recurrent metadata."""
     data = _annotations()
