@@ -30,6 +30,16 @@ def _base_model_config(**overrides):
     """Return a minimal RFDETRBaseConfig with pretrain_weights disabled."""
     defaults = dict(pretrain_weights=None, device="cpu", num_classes=5)
     defaults.update(overrides)
+    tracking = defaults.get("tracking")
+    tracking_enabled = tracking.get("enabled") if isinstance(tracking, dict) else getattr(tracking, "enabled", False)
+    if tracking_enabled:
+        defaults["class_schema"] = {
+            "foreground_classes": [
+                {"class_id": class_id, "name": f"class-{class_id}", "external_category_id": class_id}
+                for class_id in range(5)
+            ],
+            "background_logit_index": 5,
+        }
     return RFDETRBaseConfig(**defaults)
 
 
@@ -1622,7 +1632,6 @@ class TestWorkerInitFn:
         loader = getattr(dm, loader_name)()
 
         assert loader.worker_init_fn is _worker_init_fn
-
     def test_train_dataloader_sets_worker_init_fn(self, build_datamodule):
         """The training DataLoader wires the module-level worker seeding hook."""
         from rfdetr.training.module_data import _worker_init_fn

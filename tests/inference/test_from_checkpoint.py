@@ -18,7 +18,6 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
-
 from rfdetr.detr import RFDETR
 from rfdetr.detr import logger as detr_logger
 from rfdetr.platform import _IS_RFDETR_PLUS_AVAILABLE
@@ -261,6 +260,85 @@ class TestFromCheckpointEdgeCases:
         )
         call_kwargs = mock_cls.call_args.kwargs
         assert call_kwargs["num_classes"] == 5
+
+    def test_ambiguous_temporal_checkpoint_requires_class_schema(self, tmp_path: Path) -> None:
+        """A temporal checkpoint without class roles fails with migration guidance."""
+        ckpt = {
+            "args": {"pretrain_weights": "rf-detr-small.pth", "dataset_file": "video"},
+            "model_name": "RFDETRSmall",
+            "model_config": {"tracking": {"enabled": True}},
+        }
+
+        with pytest.raises(ValueError, match="class_schema.*migrate"):
+            _call_from_checkpoint(ckpt, tmp_path / "temporal.pth", "rfdetr.variants.RFDETRSmall")
+
+    def test_image_only_legacy_checkpoint_without_class_schema_remains_supported(self, tmp_path: Path) -> None:
+        """Old stateless image checkpoints keep their schema-free compatibility path."""
+        _, mock_cls = _call_from_checkpoint(
+            _dict("rf-detr-small.pth", num_classes=3),
+            tmp_path / "image.pth",
+            "rfdetr.variants.RFDETRSmall",
+        )
+
+        assert mock_cls.call_args.kwargs["num_classes"] == 3
+        assert "class_schema" not in mock_cls.call_args.kwargs
+
+    def test_ambiguous_temporal_legacy_checkpoint_does_not_use_filename_or_dataset(self, tmp_path: Path) -> None:
+        """Temporal legacy payloads without model_config require explicit migration."""
+        ckpt = {
+            "args": {
+                "pretrain_weights": None,
+                "dataset_file": "video",
+                "group_detr": 13,
+            }
+        }
+
+        with pytest.raises(ValueError, match="model_config.*Migrate.*filename or dataset"):
+            _call_from_checkpoint(
+                ckpt,
+                tmp_path / "rf-detr-small-temporal.pth",
+                "rfdetr.variants.RFDETRSmall",
+            )
+
+    def test_authoritative_temporal_checkpoint_round_trips_exact_architecture(self, tmp_path: Path) -> None:
+        """Schema-v1 model_config wins over stale trainer architecture fields."""
+        class_schema = {
+            "schema_version": 1,
+            "foreground_classes": [{"class_id": 0, "name": "person", "external_category_id": 0}],
+            "background_logit_index": 1,
+            "logit_activation": "sigmoid_independent",
+        }
+        model_config = {
+            "model_name": "RFDETRSmall",
+            "num_queries": 300,
+            "num_classes": 1,
+            "group_detr": 1,
+            "class_schema": class_schema,
+            "tracking": {"enabled": True, "max_active_tracks": 40, "discovery_reserve": 10},
+        }
+        checkpoint = {
+            "checkpoint_schema_version": 1,
+            "model_config_type": "RFDETRSmallConfig",
+            "model_config": model_config,
+            "class_schema": class_schema,
+            "train_config": {"dataset_file": "video", "group_detr": 13, "num_queries": 3900},
+            "args": {"dataset_file": "video", "group_detr": 13, "num_queries": 3900},
+            "epoch": 7,
+            "weight_flavor": "ema",
+            "source_checkpoint_hash": "a" * 64,
+        }
+
+        _, mock_cls = _call_from_checkpoint(
+            checkpoint,
+            tmp_path / "opaque-name.pth",
+            "rfdetr.variants.RFDETRSmall",
+        )
+
+        call = mock_cls.call_args.kwargs
+        assert call["group_detr"] == 1
+        assert call["num_queries"] == 300
+        assert call["class_schema"] == class_schema
+        assert call["tracking"] == {"enabled": True, "max_active_tracks": 40, "discovery_reserve": 10}
 
     def test_checkpoint_model_config_forwarded_to_constructor(self, tmp_path: Path) -> None:
         """Reload should preserve schema-dependent model config from PTL ``.pth`` checkpoints."""

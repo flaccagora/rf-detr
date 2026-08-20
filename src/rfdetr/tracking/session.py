@@ -19,7 +19,7 @@ import torch
 import torchvision.transforms.functional as F  # noqa: N812
 from PIL import Image
 
-from rfdetr.config import TrackingSessionConfig
+from rfdetr.config import TrackingPolicy, TrackingSessionConfig
 from rfdetr.models.tracking import TrackQueryState
 from rfdetr.tracking.lifecycle import LifecycleEvent, TrackSlot, TrackSlotTable, transition_lifecycle
 
@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     from supervision import Detections
 
     from rfdetr.detr import RFDETR
+    from rfdetr.models.tracking import TrackingFrameOutput
 
 
 @dataclass(frozen=True)
@@ -54,27 +55,75 @@ class TrackingSession:
     expose explicit recurrent state inputs and outputs.
     """
 
-    def __init__(self, model: RFDETR, config: TrackingSessionConfig | None = None) -> None:
+    def __init__(
+        self,
+        model: RFDETR,
+        config: TrackingSessionConfig | None = None,
+        *,
+        policy: TrackingPolicy | None = None,
+        collect_timing: bool = False,
+    ) -> None:
         """Create an empty tracking session.
 
         Args:
             model: Public RF-DETR model associated with this stream.
-            config: Optional lifecycle thresholds and expiry policy.
+            config: Optional lifecycle thresholds and expiry policy. Mutually
+                exclusive with ``policy``.
+            policy: Optional locked, versioned lifecycle policy contract (see
+                ``rfdetr.tracking.load_tracking_policy``). When given, this is
+                the same policy type deserialized by chronological
+                validation, benchmark CLIs, and deployment entry points, and
+                its foreground schema and durable capacity are validated
+                against this model before use. Mutually exclusive with
+                ``config``.
+            collect_timing: Collect synchronized per-frame latency
+                measurements. Only used with ``policy``, since ``config``
+                already carries its own ``collect_timing`` value.
+
+        Raises:
+            ValueError: If both ``config`` and ``policy`` are given, or if a
+                ``policy`` was calibrated against a different foreground
+                class schema or durable-track capacity than this model.
         """
         if not model.model_config.tracking.enabled:
             raise ValueError("TrackingSession requires model_config.tracking.enabled=True")
+        if config is not None and policy is not None:
+            raise ValueError("config and policy are mutually exclusive; a locked policy already implies its config")
         self._model = model
-        self._config = config or TrackingSessionConfig()
+        self._policy_hash: str | None = None
+        if policy is not None:
+            schema_hash = model.model_config.class_schema.sha256()
+            if policy.foreground_schema_hash != schema_hash:
+                raise ValueError(
+                    "locked policy foreground_schema_hash does not match this model's class schema; "
+                    f"policy was calibrated for {policy.foreground_schema_hash}, model has {schema_hash}"
+                )
+            capacity = model.model_config.tracking.active_capacity(model.model_config.num_queries)
+            if policy.max_active_tracks != capacity:
+                raise ValueError(
+                    "locked policy max_active_tracks does not match this model's durable-track capacity; "
+                    f"policy was calibrated for {policy.max_active_tracks}, model has {capacity}"
+                )
+            self._config = policy.to_session_config(collect_timing=collect_timing)
+            self._policy_hash = policy.sha256()
+        else:
+            self._config = config or TrackingSessionConfig()
         self._table = TrackSlotTable.empty(model.model_config.num_queries)
         self._state: TrackQueryState | None = None
         self._next_frame_index = 0
         self._last_events: tuple[LifecycleEvent, ...] = ()
         self._last_timing: TrackingTiming | None = None
+        self._last_frame_output: TrackingFrameOutput | None = None
+
+    @property
+    def policy_hash(self) -> str | None:
+        """Return the locked policy's hash, or ``None`` if constructed from a raw config."""
+        return self._policy_hash
 
     @property
     def active_tracks(self) -> tuple[TrackSlot, ...]:
         """Return an immutable snapshot of active and suspended track metadata."""
-        return tuple(slot for slot in self._table.slots if slot.status != "inactive")
+        return tuple(slot for slot in self._table.slots if slot.status in {"active", "suspended"})
 
     @property
     def last_events(self) -> tuple[LifecycleEvent, ...]:
@@ -86,6 +135,11 @@ class TrackingSession:
         """Return the most recent timing breakdown when collection is enabled."""
         return self._last_timing
 
+    @property
+    def last_frame_output(self) -> TrackingFrameOutput | None:
+        """Return the lossless low-level output produced by the latest update."""
+        return self._last_frame_output
+
     def reset(self) -> None:
         """Clear neural and host state and restart session-local IDs at zero."""
         self._table = TrackSlotTable.empty(self._model.model_config.num_queries)
@@ -93,6 +147,7 @@ class TrackingSession:
         self._next_frame_index = 0
         self._last_events = ()
         self._last_timing = None
+        self._last_frame_output = None
 
     @torch.inference_mode()
     def update(
@@ -156,9 +211,11 @@ class TrackingSession:
             self._state,
             frame_output,
             self._config,
+            self._model.model_config.class_schema,
             max_active_tracks=self._model.model_config.tracking.active_capacity(self._model.model_config.num_queries),
             frame_index=frame_index,
         )
+        self._last_frame_output = frame_output
         self._table = transition.table
         self._state = transition.state
         self._last_events = transition.events
@@ -180,10 +237,11 @@ class TrackingSession:
                 dim=-1,
             )
             slots = [self._table.slots[index] for index in visible_slots]
+            category_mapping = self._model.model_config.class_schema.external_category_mapping
             detections = Detections(
                 xyxy=xyxy.float().cpu().numpy(),
                 confidence=np.asarray([slot.confidence for slot in slots], dtype=np.float32),
-                class_id=np.asarray([slot.class_id for slot in slots], dtype=np.int64),
+                class_id=np.asarray([category_mapping[slot.class_id] for slot in slots], dtype=np.int64),
                 tracker_id=np.asarray([slot.track_id for slot in slots], dtype=np.int64),
             )
         else:

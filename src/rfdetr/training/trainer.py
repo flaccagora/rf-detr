@@ -9,7 +9,7 @@ import warnings
 from typing import Any
 
 import torch
-from pytorch_lightning import Trainer
+from pytorch_lightning import Callback, Trainer
 from pytorch_lightning.callbacks import ModelCheckpoint, RichProgressBar, TQDMProgressBar
 from pytorch_lightning.callbacks.progress.rich_progress import RichProgressBarTheme
 from pytorch_lightning.loggers import CSVLogger, MLFlowLogger, TensorBoardLogger, WandbLogger
@@ -138,6 +138,7 @@ def build_trainer(
     model_config: ModelConfig,
     *,
     accelerator: str | None = None,
+    tracking_eval_callback: Callback | None = None,
     **trainer_kwargs: Any,
 ) -> Trainer:
     """Assemble a PTL ``Trainer`` with the full RF-DETR callback and logger stack.
@@ -154,13 +155,20 @@ def build_trainer(
             Defaults to ``None`` which reads from ``train_config.accelerator`` (itself defaulting to ``"auto"``). Pass
             ``"cpu"`` to override auto-detection (e.g. when the caller explicitly requests CPU training via
             ``device="cpu"``).
+        tracking_eval_callback: Optional :class:`~rfdetr.training.callbacks.tracking_eval.TrackingEvalCallback` (or
+            any other :class:`~pytorch_lightning.Callback`) appended to the built-in callback stack. Unlike passing
+            ``callbacks=[...]`` via ``trainer_kwargs`` (which replaces the built-in callback list entirely, since
+            ``trainer_kwargs`` is applied on top of the built config dict — see below), this parameter is purely
+            additive and never disables EMA, COCO evaluation, or best-model checkpointing.
         **trainer_kwargs: Extra keyword arguments forwarded to ``pytorch_lightning.Trainer``. Use this to pass
             PTL-native flags that are not exposed through ``TrainConfig``, for example::
 
                 build_trainer(tc, mc, fast_dev_run=2)
 
             Most keys present in both ``trainer_kwargs`` and the built config dict are overridden by the value in
-            ``trainer_kwargs``. Detection and segmentation models forward ``accumulate_grad_batches`` from
+            ``trainer_kwargs`` — including ``callbacks``, which is fully replaced (not merged) if passed this way;
+            use ``tracking_eval_callback`` instead to add a callback without losing the built-in ones. Detection and
+            segmentation models forward ``accumulate_grad_batches`` from
             ``train_config.grad_accum_steps`` and ``gradient_clip_val`` from ``train_config.clip_max_norm`` to the
             Trainer normally. Keypoint models force ``accumulate_grad_batches=1`` and ``gradient_clip_val=None``
             because ``RFDETRModelModule`` owns both operations under manual optimization; passing those keys for a
@@ -399,6 +407,10 @@ def build_trainer(
             smooth_alpha=best_model_smooth_alpha,
         )
     )
+
+    # Optional caller-supplied scheduled chronological tracking evaluation (PRD Section 7.5).
+    if tracking_eval_callback is not None:
+        callbacks.append(tracking_eval_callback)
 
     # Optional early stopping.
     if tc.early_stopping:

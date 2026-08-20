@@ -54,15 +54,25 @@ def test_lifecycle_diagnostics_include_policy_and_false_track_events() -> None:
         predictions=[SequencePrediction((0.0, 0.0, 10.0, 10.0), 1, 0.9, 4)],
         lifecycle_events=(
             LifecycleEvent("activated", slot=2, track_id=4, frame_index=3),
-            LifecycleEvent("duplicate_suppressed", slot=5, track_id=None, frame_index=3),
+            LifecycleEvent(
+                "duplicate_suppressed",
+                slot=5,
+                track_id=None,
+                frame_index=3,
+                reason="duplicate_overlap",
+                score=0.8,
+                class_id=1,
+                compared_status="active",
+                overlap=0.9,
+            ),
         ),
         matched_track_ids=set(),
     )
 
     assert [event.kind for event in output.lifecycle_diagnostics] == [
         "birth",
-        "duplicate",
         "false_track_creation",
+        "duplicate",
     ]
 
 

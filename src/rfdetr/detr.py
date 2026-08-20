@@ -30,7 +30,7 @@ from PIL import Image
 
 from rfdetr.assets.coco_classes import COCO_CLASS_NAMES, COCO_CLASSES
 from rfdetr.assets.model_weights import download_pretrain_weights, get_model_cache_dir
-from rfdetr.config import ModelConfig, TrackingSessionConfig, TrainConfig
+from rfdetr.config import ModelConfig, PathLikeStr, TrackingSessionConfig, TrainConfig
 from rfdetr.datasets._keypoint_schema import (
     active_keypoint_counts,
     infer_coco_keypoint_schema,
@@ -312,11 +312,12 @@ class RFDETR:
 
         The correct subclass is resolved in order of preference:
 
-        1. ``model_name`` key in the checkpoint (written by the PTL training
+        1. ``model_config_type`` in schema-versioned checkpoints.
+        2. ``model_name`` key in the checkpoint (written by the PTL training
            stack since v1.7.0).
-        2. ``pretrain_weights`` field in the checkpoint's ``args`` entry
+        3. ``pretrain_weights`` field in the checkpoint's ``args`` entry
            (legacy fallback for older checkpoints).
-        3. The **filename** of *path* itself, used as a last resort when
+        4. The **filename** of *path* itself, used as a last resort when
            ``pretrain_weights`` is absent or an unset-like sentinel value
            (empty string, ``"none"``, or ``"null"``).  Starter weights
            published by Roboflow store ``pretrain_weights="none"`` in their
@@ -336,19 +337,12 @@ class RFDETR:
             **kwargs: Additional keyword arguments forwarded to the model
                 constructor (e.g. ``accept_platform_model_license=True`` for XLarge / 2XLarge models).
 
-                ``num_classes`` is resolved in this priority order:
+                For schema-versioned checkpoints, ``num_classes`` resolves from an explicit caller kwarg, then the
+                authoritative ``model_config``, then the constructor default. Legacy checkpoints resolve it from an
+                explicit caller kwarg, weight shape, older ``model_config``, ``args``, then the constructor default.
+                Weight shape overrides stale legacy metadata.
 
-                1. Explicit caller kwarg — always wins.
-                2. Weight inference from ``class_embed.weight`` shape in the checkpoint
-                   (``shape[0] - 1``, since the head includes a background class). This
-                   overrides a stale ``model_config`` value written before fine-tuning
-                   changed the class count.
-                3. ``saved_model_config["num_classes"]`` from the checkpoint's
-                   ``model_config`` entry — may be stale for older checkpoints.
-                4. Legacy ``args["num_classes"]`` dict entry.
-                5. Constructor default.
-
-                In cases 2–5 the field is not recorded as a user-set override, so
+                Checkpoint-derived fields are not recorded as user-set overrides, so
                 :meth:`train` can still adapt the detection head to the training
                 dataset's class count.  Pass an explicit ``num_classes=N`` to pin
                 the head and prevent adaptation.
@@ -365,9 +359,8 @@ class RFDETR:
         Raises:
             FileNotFoundError: If *path* does not exist.
             OSError: If *path* exists but cannot be read.
-            KeyError: If the checkpoint does not contain an ``"args"`` key.
-            ValueError: If the model class cannot be inferred from ``model_name``,
-                ``pretrain_weights``, or the checkpoint filename.
+            KeyError: If a legacy checkpoint does not contain an ``"args"`` key.
+            ValueError: If schema metadata is invalid or the model class cannot be inferred.
 
         Examples:
             >>> model = RFDETR.from_checkpoint("checkpoint_best_total.pth")  # doctest: +SKIP
@@ -402,7 +395,62 @@ class RFDETR:
         from rfdetr.util.io import _safe_torch_load
 
         ckpt: dict[str, Any] = _safe_torch_load(path, trust=trust_checkpoint)
-        args = ckpt["args"]
+        checkpoint_schema_version = ckpt.get("checkpoint_schema_version")
+        if checkpoint_schema_version is not None and checkpoint_schema_version != 1:
+            raise ValueError(
+                f"Unsupported checkpoint_schema_version={checkpoint_schema_version!r}; migrate the checkpoint "
+                "with a compatible RF-DETR release."
+            )
+        args = ckpt.get("train_config", ckpt.get("args")) if checkpoint_schema_version == 1 else ckpt["args"]
+        saved_model_config = ckpt.get("model_config")
+        if checkpoint_schema_version == 1:
+            required_metadata = {
+                "model_config_type",
+                "model_config",
+                "class_schema",
+                "train_config",
+                "epoch",
+                "weight_flavor",
+                "source_checkpoint_hash",
+            }
+            missing_metadata = sorted(required_metadata - ckpt.keys())
+            if missing_metadata or not isinstance(saved_model_config, dict) or not isinstance(args, dict):
+                detail = f" missing {missing_metadata}" if missing_metadata else " invalid model/train config"
+                raise ValueError(f"Checkpoint schema v1 metadata is incomplete:{detail}; re-save or migrate it.")
+            model_config_type = ckpt["model_config_type"]
+            if not isinstance(model_config_type, str) or not model_config_type.endswith("Config"):
+                raise ValueError("Checkpoint model_config_type is invalid; re-save or migrate it.")
+            if ckpt["class_schema"] != saved_model_config.get("class_schema"):
+                raise ValueError("Checkpoint class_schema conflicts with authoritative model_config; migrate it.")
+        saved_tracking = saved_model_config.get("tracking") if isinstance(saved_model_config, dict) else None
+        checkpoint_dataset_file = (
+            args.get("dataset_file") if isinstance(args, dict) else getattr(args, "dataset_file", None)
+        )
+        checkpoint_is_temporal = (
+            isinstance(saved_tracking, dict) and saved_tracking.get("enabled") is True
+        ) or checkpoint_dataset_file == "video"
+        if checkpoint_is_temporal and not isinstance(saved_model_config, dict):
+            raise ValueError(
+                "Ambiguous temporal legacy checkpoint has no authoritative model_config. "
+                "Migrate and re-save it with its verified training architecture; filename or dataset reconstruction "
+                "is not safe."
+            )
+        requested_tracking = kwargs.get("tracking")
+        requested_tracking_enabled = (
+            requested_tracking.get("enabled") is True
+            if isinstance(requested_tracking, dict)
+            else getattr(requested_tracking, "enabled", False) is True
+        )
+        saved_class_schema = saved_model_config.get("class_schema") if isinstance(saved_model_config, dict) else None
+        if (
+            (checkpoint_is_temporal or requested_tracking_enabled)
+            and saved_class_schema is None
+            and "class_schema" not in kwargs
+        ):
+            raise ValueError(
+                "Temporal checkpoint class_schema is missing, so foreground and background/no-object logits are "
+                "ambiguous. Pass a verified class_schema explicitly, then migrate and re-save the checkpoint."
+            )
 
         _variant_name_to_class: dict[str, type[RFDETR]] = {
             getattr(variant_obj, "__name__", symbol): variant_obj
@@ -451,10 +499,24 @@ class RFDETR:
         if _large_deprecated_cls is not None:
             _name_map["RFDETRLargeDeprecated"] = _large_deprecated_cls
         saved_model_name = ckpt.get("model_name")
+        saved_model_config_type = ckpt.get("model_config_type")
         model_cls: type[RFDETR] | None = None
+        if isinstance(saved_model_config_type, str) and saved_model_config_type.endswith("Config"):
+            config_model_name = saved_model_config_type.removesuffix("Config")
+            model_cls = _name_map.get(config_model_name)
+            if (
+                checkpoint_schema_version == 1
+                and model_cls is None
+                and config_model_name not in (_CHECKPOINT_PLUS_MODEL_NAME_CLASS_SYMBOLS)
+            ):
+                raise ValueError(f"Unknown checkpoint model_config_type={saved_model_config_type!r}; migrate it.")
+        else:
+            config_model_name = ""
         if isinstance(saved_model_name, str):
             normalized_name = saved_model_name.strip()
-            if normalized_name:
+            if checkpoint_schema_version == 1 and normalized_name and normalized_name != config_model_name:
+                raise ValueError("Checkpoint model_name conflicts with authoritative model_config_type; migrate it.")
+            if normalized_name and model_cls is None:
                 model_cls = _name_map.get(normalized_name)
         else:
             normalized_name = ""
@@ -482,7 +544,10 @@ class RFDETR:
             # Guard: plus-only checkpoints should raise an actionable install error
             # when rfdetr_plus is missing, regardless of whether class inference
             # relies on model_name (new format) or pretrain_weights (legacy format).
-            plus_by_model_name = normalized_name in _CHECKPOINT_PLUS_MODEL_NAME_CLASS_SYMBOLS
+            plus_by_model_name = (
+                normalized_name in _CHECKPOINT_PLUS_MODEL_NAME_CLASS_SYMBOLS
+                or config_model_name in _CHECKPOINT_PLUS_MODEL_NAME_CLASS_SYMBOLS
+            )
             plus_by_weights_name = (
                 "xlarge" in weights_name and "seg-" not in weights_name and "keypoint-preview" not in weights_name
             )
@@ -534,7 +599,6 @@ class RFDETR:
             if isinstance(_mc_legacy, dict):
                 _mc_fields = _mc_legacy
 
-        saved_model_config = ckpt.get("model_config")
         if isinstance(saved_model_config, dict):
             for key, value in saved_model_config.items():
                 if key == "pretrain_weights":
@@ -543,7 +607,7 @@ class RFDETR:
                     constructor_kwargs[key] = value
                     checkpoint_config_keys.add(key)
 
-        if num_classes is not None and "num_classes" not in kwargs:
+        if checkpoint_schema_version is None and num_classes is not None and "num_classes" not in kwargs:
             constructor_kwargs["num_classes"] = num_classes
             checkpoint_config_keys.add("num_classes")
 
@@ -562,7 +626,7 @@ class RFDETR:
                     if key.startswith("_orig_mod."):
                         key = key[len("_orig_mod.") :]
                     _ckpt_weights[key] = v
-        if _ckpt_weights:
+        if _ckpt_weights and checkpoint_schema_version is None:
             # num_keypoints_per_class — inferred from _kp_active_mask (shape [num_classes, max_kp]).
             # Reflects what the model actually learned; saved model_config may carry the COCO default
             # [0, 17] even after fine-tuning on a different keypoint schema.
@@ -693,8 +757,13 @@ class RFDETR:
           ``accelerator="gpu"`` and optionally ``devices=[N]``; ``"mps"`` becomes ``accelerator="mps"``. Other valid
           torch device types fall back to PTL auto-detection and emit a :class:`UserWarning`.
         * ``callbacks`` — if the dict contains any non-empty lists a
-          :class:`DeprecationWarning` is emitted; the dict is then discarded. Use PTL
-          :class:`~pytorch_lightning.Callback` objects passed via :func:`~rfdetr.training.build_trainer` instead.
+          :class:`DeprecationWarning` is emitted; the dict is then discarded. Use
+          ``tracking_eval_callback`` (below), or call :func:`~rfdetr.training.build_trainer` directly, instead.
+        * ``tracking_eval_callback`` — an optional single PTL
+          :class:`~pytorch_lightning.Callback` (for example
+          :class:`~rfdetr.training.callbacks.tracking_eval.TrackingEvalCallback`) forwarded additively to
+          :func:`~rfdetr.training.build_trainer` — unlike the deprecated ``callbacks`` dict above, this does not
+          replace or disable any built-in callback.
         * ``start_epoch`` — emits :class:`DeprecationWarning` and is dropped.
         * ``do_benchmark`` — emits :class:`DeprecationWarning` and is dropped.
         * ``notes`` — optional user-defined metadata (string, dict, list, or
@@ -747,6 +816,11 @@ class RFDETR:
                 DeprecationWarning,
                 stacklevel=2,
             )
+
+        # Optional single PTL Callback (e.g. TrackingEvalCallback) forwarded to
+        # build_trainer() additively — not part of TrainConfig since a live Callback
+        # instance is not a serializable training hyperparameter.
+        tracking_eval_callback = kwargs.pop("tracking_eval_callback", None)
 
         # Parse `device` kwarg and map it to PTL accelerator/devices.
         # Supports torch-style strings and torch.device (e.g. "cuda:1").
@@ -874,7 +948,9 @@ class RFDETR:
         trainer_kwargs = {"accelerator": _accelerator}
         if _devices is not None:
             trainer_kwargs["devices"] = _devices
-        trainer = build_trainer(config, self.model_config, **trainer_kwargs)
+        trainer = build_trainer(
+            config, self.model_config, tracking_eval_callback=tracking_eval_callback, **trainer_kwargs
+        )
         trainer.fit(module, datamodule, ckpt_path=config.resume or None)
 
         # Sync the trained weights back so predict() / export() see the updated model.
@@ -1770,17 +1846,42 @@ class RFDETR:
         """
         return _build_model_context(config)
 
-    def create_tracking_session(self, config: TrackingSessionConfig | None = None) -> TrackingSession:
+    def create_tracking_session(
+        self,
+        config: TrackingSessionConfig | None = None,
+        *,
+        policy_lock_path: PathLikeStr | None = None,
+        collect_timing: bool = False,
+    ) -> TrackingSession:
         """Create independent recurrent state for one logical video stream.
 
         Args:
-            config: Optional lifecycle thresholds and expiry policy.
+            config: Optional lifecycle thresholds and expiry policy. Mutually
+                exclusive with ``policy_lock_path``.
+            policy_lock_path: Optional path to a locked lifecycle policy
+                artifact (``tracking_policy.lock.json``). This is the same
+                deployment entry point used by chronological validation and
+                benchmark CLIs: the locked policy is deserialized through
+                ``rfdetr.tracking.load_tracking_policy`` into the same
+                versioned ``TrackingPolicy`` type, validated against this
+                model's foreground class schema and durable-track capacity,
+                and applied to the returned session. The resulting session's
+                ``policy_hash`` property exposes the loaded policy's hash.
+                Mutually exclusive with ``config``.
+            collect_timing: Collect synchronized per-frame latency
+                measurements. Only used with ``policy_lock_path``.
 
         Returns:
             A new empty single-stream tracking session.
         """
-        from rfdetr.tracking import TrackingSession
+        from rfdetr.tracking import TrackingSession, load_tracking_policy
 
+        if policy_lock_path is not None:
+            if config is not None:
+                raise ValueError("config and policy_lock_path are mutually exclusive")
+            return TrackingSession(
+                self, policy=load_tracking_policy(policy_lock_path), collect_timing=collect_timing
+            )
         return TrackingSession(self, config)
 
     @property

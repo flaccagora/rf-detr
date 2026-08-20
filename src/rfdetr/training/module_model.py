@@ -10,6 +10,8 @@ from __future__ import annotations
 import math
 import random
 import warnings
+from collections.abc import Sequence
+from dataclasses import replace
 from typing import Any
 
 import torch
@@ -17,16 +19,22 @@ import torch.nn.functional as F  # noqa: N812 -- project-conventional alias (see
 from pytorch_lightning import LightningModule, seed_everything
 
 from rfdetr._namespace import _namespace_from_configs
-from rfdetr.config import ModelConfig, TrackingSessionConfig, TrainConfig
+from rfdetr.config import ClassSchema, ModelConfig, TrainConfig
 from rfdetr.datasets.coco import compute_multi_scale_scales
 from rfdetr.models.lwdetr import build_criterion_from_config, build_model_from_config
 from rfdetr.models.matcher import SequenceAssignment, identity_aware_sequence_assignment
 from rfdetr.models.tracking import TrackingFrameOutput, TrackQueryState
 from rfdetr.models.weights import apply_lora, interpolate_position_embeddings, load_pretrain_weights
+from rfdetr.tracking.lifecycle import TrackSlotTable, transition_lifecycle
+from rfdetr.training.checkpoint import authoritative_checkpoint_metadata, source_checkpoint_hash
 from rfdetr.training.param_groups import get_param_dict
 from rfdetr.utilities.logger import get_logger
 
 logger = get_logger()
+
+_FALSE_POSITIVE_INJECTION_SALT = 1
+_QUERY_DROPOUT_SALT = 2
+_ERROR_EXPOSURE_LOGIT_MAGNITUDE = 8.0
 
 _TRAIN_PROGRESS_LOSS_ALIASES: dict[str, str] = {
     "loss_ce": "loss_cls",
@@ -62,6 +70,13 @@ class RFDETRModelModule(LightningModule):
         self._use_manual_optimization: bool = bool(getattr(model_config, "use_grouppose_keypoints", False))
         self.automatic_optimization = not self._use_manual_optimization
         self._accumulated_box_normalizer: torch.Tensor | None = None
+        # Decoded-frame LR progress (PRD Section 7.6): frames forwarded since the last
+        # scheduler step, the running total, and the per-optimizer-step frame reference
+        # used to convert that total into the step-equivalent domain configure_optimizers()'
+        # lr_lambda already expects. See _decoded_frame_count / _step_lr_scheduler.
+        self._pending_decoded_frames: int = 0
+        self._decoded_frames_seen: float = 0.0
+        self._decoded_frames_per_optimizer_step: float = 1.0
         # Allow partial state-dict loading when resuming from a .pth checkpoint
         # (which contains only model weights, not criterion/postprocess state).
         self.strict_loading = False
@@ -87,6 +102,7 @@ class RFDETRModelModule(LightningModule):
         # Build criterion/postprocessors after potential num_classes alignment so
         # they are constructed with a config that matches the current model head.
         self.criterion, self.postprocess = build_criterion_from_config(self.model_config, self.train_config)
+        self._source_checkpoint_hash = source_checkpoint_hash(self.model_config)
 
         # torch.compile is opt-in: set model_config.compile=True to enable.
         # Only enabled on CUDA; MPS and CPU do not benefit from compilation.
@@ -204,6 +220,7 @@ class RFDETRModelModule(LightningModule):
             detached postprocessed predictions for train mAP logging.
         """
         samples, targets = batch
+        self._pending_decoded_frames += self._decoded_frame_count(samples, targets)
         if self.model_config.tracking.enabled and isinstance(samples, (tuple, list)):
             return self._training_step_tracking(samples, targets, batch_idx)
         batch_size = len(targets)
@@ -296,29 +313,46 @@ class RFDETRModelModule(LightningModule):
             outputs["enc_outputs"] = frame.enc_outputs
         return outputs
 
-    def _commit_tracking_state(
+    @staticmethod
+    def _slice_frame_output(frame: TrackingFrameOutput, batch_index: int) -> TrackingFrameOutput:
+        """Select one batch item's tracking output as a single-stream frame.
+
+        ``transition_lifecycle`` operates on exactly one stream at a time (it is the same
+        pure function ``TrackingSession`` calls during deployment), so a batched training
+        clip must be split into per-item single-stream frames before each lifecycle update.
+        """
+        candidate = frame.candidate_state
+        return TrackingFrameOutput(
+            pred_logits=frame.pred_logits[batch_index : batch_index + 1],
+            pred_boxes=frame.pred_boxes[batch_index : batch_index + 1],
+            candidate_state=TrackQueryState(
+                candidate.query_features[batch_index : batch_index + 1],
+                candidate.reference_boxes[batch_index : batch_index + 1],
+                candidate.active_mask[batch_index : batch_index + 1],
+            ),
+            input_active_mask=frame.input_active_mask[batch_index : batch_index + 1],
+        )
+
+    def _commit_tracking_state_assignment_guided(
         self,
         frame: TrackingFrameOutput,
         assignments: list[SequenceAssignment],
-        prior_state: TrackQueryState | None,
+        prior_state: TrackQueryState,
         prior_track_ids: list[tuple[int | None, ...]],
-        *,
-        inference_like: bool,
     ) -> tuple[TrackQueryState, list[tuple[int | None, ...]]]:
-        """Commit predicted candidate tensors under the configured clip lifecycle.
+        """Commit predicted tensors with ground-truth-driven identity.
 
-        Ground-truth assignments establish slot identity, but the recurrent tensors always come from model predictions.
-        In inference-like mode, prediction confidence additionally gates activation and continuation. Weak persistent
-        slots preserve their preceding trusted tensors.
+        This is the matched control described by PRD US-018/US-022: whether a query keeps
+        or gains a track identity follows ground-truth assignment rather than the model's
+        own confidence, so it isolates the effect of inference-like state commitment in
+        head-to-head training comparisons.
         """
         candidate = frame.candidate_state
         features = candidate.query_features.clone()
         boxes = candidate.reference_boxes.clone()
         next_ids: list[tuple[int | None, ...]] = []
         active_masks: list[torch.Tensor] = []
-        scores = frame.pred_logits.sigmoid().amax(dim=-1)
         capacity = self.model_config.tracking.active_capacity(self.model_config.num_queries)
-        lifecycle = TrackingSessionConfig()
 
         for batch_index, (assignment, old_ids) in enumerate(zip(assignments, prior_track_ids, strict=True)):
             committed_ids = list(old_ids)
@@ -329,39 +363,272 @@ class RFDETRModelModule(LightningModule):
             target_ids = list(assignment.slot_track_ids)
 
             for query_index in range(len(old_ids)):
-                if old_ids[query_index] is not None and query_index not in visible_queries and prior_state is not None:
+                if old_ids[query_index] is not None and query_index not in visible_queries:
                     features[batch_index, query_index] = prior_state.query_features[batch_index, query_index]
                     boxes[batch_index, query_index] = prior_state.reference_boxes[batch_index, query_index]
 
             for query_index, _ in discovery_pairs:
                 proposed_id = target_ids[query_index]
                 can_activate = proposed_id is not None and sum(value is not None for value in committed_ids) < capacity
-                if inference_like:
-                    can_activate = can_activate and bool(
-                        scores[batch_index, query_index] >= lifecycle.activation_threshold
-                    )
                 if can_activate:
                     committed_ids[query_index] = proposed_id
 
-            if inference_like and prior_state is not None:
-                for query_index, track_id in enumerate(old_ids):
-                    if track_id is None or query_index not in visible_queries:
-                        continue
-                    if scores[batch_index, query_index] < lifecycle.continuation_threshold:
-                        features[batch_index, query_index] = prior_state.query_features[batch_index, query_index]
-                        boxes[batch_index, query_index] = prior_state.reference_boxes[batch_index, query_index]
-
             next_ids.append(tuple(committed_ids))
-            active_masks.append(torch.tensor([value is not None for value in committed_ids], device=scores.device))
+            active_masks.append(
+                torch.tensor([value is not None for value in committed_ids], device=features.device)
+            )
 
-        state = TrackQueryState(features, boxes, torch.stack(active_masks).bool())
+        return TrackQueryState(features, boxes, torch.stack(active_masks).bool()), next_ids
+
+    def _error_exposure_draws(
+        self, *, salt: int, frame_index: int, batch_index: int, count: int
+    ) -> list[float]:
+        """Deterministic uniform draws for one frame/batch-item/mechanism triple (PRD US-019).
+
+        Seeded only from ``TrackingTrainConfig.error_exposure_seed`` plus the salt, frame, and
+        batch indices -- never from global RNG state -- so injection/dropout decisions are
+        reproducible across repeated runs regardless of dataloader shuffling or other
+        randomness consumed earlier in the step.
+        """
+        if count <= 0:
+            return []
+        base_seed = self.train_config.tracking.error_exposure_seed
+        combined_seed = ((base_seed * 1_000_003 + salt) * 1_000_003 + frame_index) * 1_000_003 + batch_index
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(combined_seed % (2**63 - 1))
+        return torch.rand(count, generator=generator).tolist()
+
+    def _select_false_positive_injection_indices(
+        self,
+        table: TrackSlotTable,
+        assignment: SequenceAssignment,
+        *,
+        frame_index: int,
+        batch_index: int,
+        probability: float,
+        max_count: int,
+    ) -> list[int]:
+        """Select ground-truth-unmatched inactive slots to force-activate this frame.
+
+        Candidates are query positions with no correspondence at all in ``assignment`` (neither
+        continuing nor discovery) -- genuine "unmatched query states" -- restricted to currently
+        inactive slots so injection creates a new synthetic false-positive track rather than
+        altering an already-tracked identity. Selection is capped at ``max_count`` (the
+        remaining per-sample injection budget) by keeping the lowest-drawn eligible candidates,
+        which is deterministic given the seeded draws.
+        """
+        if max_count <= 0:
+            return []
+        matched = set(assignment.decoder_indices[0].tolist())
+        candidates = [index for index, slot in enumerate(table.slots) if slot.status == "inactive" and index not in matched]
+        if not candidates:
+            return []
+        draws = self._error_exposure_draws(
+            salt=_FALSE_POSITIVE_INJECTION_SALT, frame_index=frame_index, batch_index=batch_index, count=len(candidates)
+        )
+        ranked = sorted(zip(candidates, draws), key=lambda pair: pair[1])
+        return [index for index, draw in ranked if draw < probability][:max_count]
+
+    def _select_query_dropout_indices(
+        self,
+        table: TrackSlotTable,
+        *,
+        frame_index: int,
+        batch_index: int,
+        probability: float,
+    ) -> list[int]:
+        """Select active slots to force a missed-detection score this frame.
+
+        Never selects every currently active slot: if every draw qualifies, the
+        least-confidently-dropped index (highest draw) is spared so a sample can never lose
+        all active identities to dropout in one frame.
+        """
+        candidates = [index for index, slot in enumerate(table.slots) if slot.status == "active"]
+        if not candidates:
+            return []
+        draws = self._error_exposure_draws(
+            salt=_QUERY_DROPOUT_SALT, frame_index=frame_index, batch_index=batch_index, count=len(candidates)
+        )
+        paired = list(zip(candidates, draws))
+        selected = [index for index, draw in paired if draw < probability]
+        if len(selected) == len(candidates):
+            survivor_index = max(paired, key=lambda pair: pair[1])[0]
+            selected = [index for index in selected if index != survivor_index]
+        return selected
+
+    def _inject_false_positive_scores(
+        self, frame: TrackingFrameOutput, indices: Sequence[int], class_schema: ClassSchema
+    ) -> TrackingFrameOutput:
+        """Force selected inactive slots' foreground scores well above any activation threshold."""
+        if not indices:
+            return frame
+        pred_logits = frame.pred_logits.clone()
+        target_class = class_schema.foreground_class_ids[0]
+        for index in indices:
+            pred_logits[0, index, :] = -_ERROR_EXPOSURE_LOGIT_MAGNITUDE
+            pred_logits[0, index, target_class] = _ERROR_EXPOSURE_LOGIT_MAGNITUDE
+        return replace(frame, pred_logits=pred_logits)
+
+    def _apply_query_dropout_scores(
+        self, frame: TrackingFrameOutput, indices: Sequence[int], class_schema: ClassSchema
+    ) -> TrackingFrameOutput:
+        """Force selected active slots' foreground scores well below any continuation threshold."""
+        if not indices:
+            return frame
+        pred_logits = frame.pred_logits.clone()
+        for index in indices:
+            for class_id in class_schema.foreground_class_ids:
+                pred_logits[0, index, class_id] = -_ERROR_EXPOSURE_LOGIT_MAGNITUDE
+            if class_schema.background_logit_index is not None:
+                pred_logits[0, index, class_schema.background_logit_index] = _ERROR_EXPOSURE_LOGIT_MAGNITUDE
+        return replace(frame, pred_logits=pred_logits)
+
+    def _commit_tracking_state_inference_like(
+        self,
+        frame: TrackingFrameOutput,
+        assignments: list[SequenceAssignment],
+        prior_state: TrackQueryState,
+        tables: list[TrackSlotTable],
+        *,
+        frame_index: int,
+        fp_injection_remaining: list[int] | None = None,
+    ) -> tuple[TrackQueryState, list[tuple[int | None, ...]], list[TrackSlotTable]]:
+        """Commit state through the exact deployment lifecycle state machine.
+
+        Ground-truth assignment plays no role in the committed lifecycle decisions themselves:
+        every activation, suspension, recovery, and termination follows
+        :func:`transition_lifecycle`, the same pure function ``TrackingSession`` calls at
+        inference, driven only by the model's own foreground scores. This is what lets training
+        see -- and learn to recover from -- the model's own false positives, false negatives,
+        and stale suspended references instead of having ground truth silently repair them.
+
+        ``assignments`` is consulted only by the optional PRD US-019 error-exposure pilots
+        (``false_positive_injection_enabled`` / ``query_dropout_enabled``), which perturb the
+        *candidate scores* fed into ``transition_lifecycle`` -- never the lifecycle decision
+        itself -- to select which ground-truth-unmatched candidates get force-activated or which
+        active slots get force-dropped this frame, deterministically.
+        """
+        if self.model_config.class_schema is None:
+            raise ValueError("prediction-driven tracking requires an authoritative class_schema")
+        class_schema = self.model_config.class_schema
+        tracking_config = self.train_config.tracking
+        lifecycle_config = tracking_config.lifecycle
+        capacity = self.model_config.tracking.active_capacity(self.model_config.num_queries)
+
+        next_tables: list[TrackSlotTable] = []
+        next_ids: list[tuple[int | None, ...]] = []
+        features: list[torch.Tensor] = []
+        boxes: list[torch.Tensor] = []
+        active_masks: list[torch.Tensor] = []
+
+        for batch_index, table in enumerate(tables):
+            item_state = TrackQueryState(
+                prior_state.query_features[batch_index : batch_index + 1],
+                prior_state.reference_boxes[batch_index : batch_index + 1],
+                prior_state.active_mask[batch_index : batch_index + 1],
+            )
+            item_frame = self._slice_frame_output(frame, batch_index)
+
+            if tracking_config.false_positive_injection_enabled and fp_injection_remaining is not None:
+                injected = self._select_false_positive_injection_indices(
+                    table,
+                    assignments[batch_index],
+                    frame_index=frame_index,
+                    batch_index=batch_index,
+                    probability=tracking_config.false_positive_injection_probability,
+                    max_count=fp_injection_remaining[batch_index],
+                )
+                if injected:
+                    item_frame = self._inject_false_positive_scores(item_frame, injected, class_schema)
+                    fp_injection_remaining[batch_index] -= len(injected)
+
+            if tracking_config.query_dropout_enabled:
+                dropped = self._select_query_dropout_indices(
+                    table,
+                    frame_index=frame_index,
+                    batch_index=batch_index,
+                    probability=tracking_config.query_dropout_probability,
+                )
+                if dropped:
+                    item_frame = self._apply_query_dropout_scores(item_frame, dropped, class_schema)
+
+            transition = transition_lifecycle(
+                table,
+                item_state,
+                item_frame,
+                lifecycle_config,
+                class_schema,
+                max_active_tracks=capacity,
+                frame_index=frame_index,
+            )
+            next_tables.append(transition.table)
+            next_ids.append(transition.table.slot_track_ids)
+            features.append(transition.state.query_features)
+            boxes.append(transition.state.reference_boxes)
+            active_masks.append(transition.state.active_mask)
+
+        state = TrackQueryState(torch.cat(features, dim=0), torch.cat(boxes, dim=0), torch.cat(active_masks, dim=0))
+        return state, next_ids, next_tables
+
+    def _commit_tracking_state(
+        self,
+        frame: TrackingFrameOutput,
+        assignments: list[SequenceAssignment],
+        prior_state: TrackQueryState,
+        prior_track_ids: list[tuple[int | None, ...]],
+        tables: list[TrackSlotTable] | None,
+        *,
+        frame_index: int,
+        inference_like: bool,
+        fp_injection_remaining: list[int] | None = None,
+    ) -> tuple[TrackQueryState, list[tuple[int | None, ...]], list[TrackSlotTable] | None]:
+        """Commit one frame's recurrent state under the configured clip lifecycle.
+
+        Ground-truth assignment always remains available to :meth:`_compute_train_losses`
+        for loss construction, but it is deliberately not consulted here in inference-like
+        mode: the committed identities, tensors, and lifecycle transitions come only from
+        the model's own predictions, exactly as they would at deployment. The one exception is
+        the optional PRD US-019 error-exposure pilots, which use ``assignments`` only to pick
+        *which* candidates to perturb before the lifecycle decision runs -- see
+        :meth:`_commit_tracking_state_inference_like`.
+
+        Args:
+            frame: Slot-aligned candidate output for the current frame.
+            assignments: Ground-truth identity assignment for this frame, used by the
+                assignment-guided control and by the inference-like error-exposure pilots.
+            prior_state: Recurrent state committed after the preceding frame.
+            prior_track_ids: Per-item slot identity table entering this frame.
+            tables: Per-item lifecycle host state entering this frame. Required and updated
+                in inference-like mode; unused and passed through as ``None`` otherwise.
+            frame_index: Monotonically increasing clip-local frame index.
+            inference_like: Selects the prediction-driven lifecycle over the assignment-guided
+                control.
+            fp_injection_remaining: Per-item remaining false-positive-injection budget for the
+                whole clip, mutated in place. ``None`` when injection is disabled.
+
+        Returns:
+            Committed state, the next slot identity table, and the next lifecycle host state
+            (``None`` in assignment-guided mode).
+        """
+        if inference_like:
+            if tables is None:
+                raise ValueError("inference-like tracking requires per-item lifecycle tables")
+            state, next_ids, next_tables = self._commit_tracking_state_inference_like(
+                frame, assignments, prior_state, tables, frame_index=frame_index, fp_injection_remaining=fp_injection_remaining
+            )
+        else:
+            state, next_ids = self._commit_tracking_state_assignment_guided(
+                frame, assignments, prior_state, prior_track_ids
+            )
+            next_tables = None
+
         if self.train_config.tracking.detach_state_between_frames:
             state = TrackQueryState(
                 state.query_features.detach(),
                 state.reference_boxes.detach(),
                 state.active_mask,
             )
-        return state, next_ids
+        return state, next_ids, next_tables
 
     def _unroll_tracking_clip(
         self,
@@ -371,19 +638,66 @@ class RFDETRModelModule(LightningModule):
         inference_like: bool,
         compute_losses: bool = True,
         tracking_model: Any | None = None,
+        burn_in_frames: int = 0,
+        tbptt_chunk_frames: int | None = None,
     ) -> tuple[dict[str, torch.Tensor], list[tuple[dict[str, Any], tuple]]]:
-        """Causally unroll one time-major clip and return frame-mean losses and outputs."""
+        """Causally unroll one time-major clip and return frame-mean losses and outputs.
+
+        Implements the PRD Section 7.6 long-horizon curriculum: ``burn_in_frames`` leading
+        frames are unrolled under ``torch.no_grad()`` through the prediction-driven
+        inference-like lifecycle (regardless of ``inference_like``) so the model enters the
+        supervised suffix with a causally realistic state history it never backpropagates
+        through. The remaining supervised frames are grouped into truncated-backpropagation
+        chunks of ``tbptt_chunk_frames`` frames (``None`` keeps the whole supervised suffix as
+        one chunk, matching pre-curriculum behavior); recurrent state is detached after every
+        chunk so no gradient crosses a chunk boundary. Losses are averaged only over supervised
+        frames, so the loss scale does not grow with the burn-in or supervised suffix length.
+
+        Args:
+            frame_batches: Time-major per-frame ``NestedTensor`` samples for the whole clip.
+            target_batches: Time-major per-frame target dictionaries for the whole clip.
+            inference_like: Selects the prediction-driven lifecycle over the assignment-guided
+                control for the *supervised* frames. Burn-in frames always use the
+                prediction-driven lifecycle.
+            compute_losses: Whether to compute per-frame supervised losses.
+            tracking_model: Optional model override (defaults to ``self.model``).
+            burn_in_frames: Leading frames of the clip excluded from the loss and run without
+                gradient. Must be in ``[0, len(frame_batches))``.
+            tbptt_chunk_frames: Number of consecutive supervised frames backpropagated together
+                before recurrent state is detached. ``None`` means one chunk for the whole
+                supervised suffix.
+
+        Returns:
+            Frame-mean supervised losses and the per-frame ``(outputs, targets)`` pairs for
+            every frame that received a forward pass (burn-in included).
+        """
         if len(frame_batches) != len(target_batches) or not frame_batches:
             raise ValueError("tracking frame and target batches must have the same nonzero clip length")
         if len(frame_batches) != self.train_config.tracking.clip_length:
             raise ValueError(
                 f"received clip length {len(frame_batches)}, expected {self.train_config.tracking.clip_length}"
             )
+        if not 0 <= burn_in_frames < len(frame_batches):
+            raise ValueError(
+                f"burn_in_frames ({burn_in_frames}) must be in [0, clip_length) for a clip of length "
+                f"{len(frame_batches)}"
+            )
+        if tbptt_chunk_frames is not None and tbptt_chunk_frames < 1:
+            raise ValueError(f"tbptt_chunk_frames ({tbptt_chunk_frames}) must be at least one frame")
 
         batch_size = len(target_batches[0])
         slot_track_ids = [tuple(None for _ in range(self.model_config.num_queries)) for _ in range(batch_size)]
+        needs_tables = inference_like or burn_in_frames > 0
+        tables: list[TrackSlotTable] | None = (
+            [TrackSlotTable.empty(self.model_config.num_queries) for _ in range(batch_size)] if needs_tables else None
+        )
+        fp_injection_remaining: list[int] | None = (
+            [self.train_config.tracking.false_positive_injection_max_per_sample] * batch_size
+            if inference_like and self.train_config.tracking.false_positive_injection_enabled
+            else None
+        )
         first_tensors = frame_batches[0].tensors
-        state: TrackQueryState | None = TrackQueryState.empty(
+        state: TrackQueryState = TrackQueryState.empty(
             batch_size=batch_size,
             num_queries=self.model_config.num_queries,
             hidden_dim=self.model_config.hidden_dim,
@@ -393,7 +707,12 @@ class RFDETRModelModule(LightningModule):
         frame_losses: list[dict[str, torch.Tensor]] = []
         frame_outputs: list[tuple[dict[str, Any], tuple]] = []
         active_model = self.model if tracking_model is None else tracking_model
-        for samples, targets in zip(frame_batches, target_batches, strict=True):
+
+        def _run_frame(
+            frame_index: int, *, frame_inference_like: bool, record_loss: bool, injection_remaining: list[int] | None
+        ) -> None:
+            nonlocal state, slot_track_ids, tables
+            samples, targets = frame_batches[frame_index], target_batches[frame_index]
             if len(targets) != batch_size:
                 raise ValueError("every sequence time step must have the same batch size")
             frame = active_model.forward_tracking(samples, state)
@@ -401,16 +720,43 @@ class RFDETRModelModule(LightningModule):
             assignments = identity_aware_sequence_assignment(
                 self.criterion.matcher, outputs, list(targets), slot_track_ids
             )
-            if compute_losses:
+            if record_loss:
                 frame_losses.append(self.criterion(outputs, list(targets), assignments))
-            state, slot_track_ids = self._commit_tracking_state(
+            state, slot_track_ids, tables = self._commit_tracking_state(
                 frame,
                 assignments,
                 state,
                 slot_track_ids,
-                inference_like=inference_like,
+                tables,
+                frame_index=frame_index,
+                inference_like=frame_inference_like,
+                fp_injection_remaining=injection_remaining,
             )
             frame_outputs.append((outputs, targets))
+
+        # Burn-in: prediction-driven recurrence under no gradient (PRD Section 7.6). Never
+        # contributes to the loss, never injects synthetic errors, and always commits through
+        # the inference-like lifecycle regardless of the supervised suffix's lifecycle_mode.
+        if burn_in_frames > 0:
+            with torch.no_grad():
+                for frame_index in range(burn_in_frames):
+                    _run_frame(frame_index, frame_inference_like=True, record_loss=False, injection_remaining=None)
+            state = TrackQueryState(state.query_features.detach(), state.reference_boxes.detach(), state.active_mask)
+
+        # Supervised suffix, causally unrolled in truncated-backpropagation-through-time chunks.
+        # Detaching state after every chunk means no gradient flows across a chunk boundary --
+        # and, since the loop ends at the clip boundary, no gradient graph survives past the clip.
+        supervised_indices = range(burn_in_frames, len(frame_batches))
+        chunk_size = tbptt_chunk_frames if tbptt_chunk_frames is not None else max(1, len(supervised_indices))
+        for offset, frame_index in enumerate(supervised_indices):
+            _run_frame(
+                frame_index,
+                frame_inference_like=inference_like,
+                record_loss=compute_losses,
+                injection_remaining=fp_injection_remaining,
+            )
+            if (offset + 1) % chunk_size == 0:
+                state = TrackQueryState(state.query_features.detach(), state.reference_boxes.detach(), state.active_mask)
 
         loss_names = set().union(*(losses.keys() for losses in frame_losses)) if frame_losses else set()
         mean_losses = {
@@ -422,10 +768,13 @@ class RFDETRModelModule(LightningModule):
         self, frame_batches: tuple | list, target_batches: tuple | list, batch_idx: int
     ) -> torch.Tensor:
         """Run one causal video-training step with clip-local recurrent state."""
+        tracking_config = self.train_config.tracking
         loss_dict, _ = self._unroll_tracking_clip(
             frame_batches,
             target_batches,
-            inference_like=self.train_config.tracking.lifecycle_mode == "inference_like",
+            inference_like=tracking_config.lifecycle_mode == "inference_like",
+            burn_in_frames=tracking_config.burn_in_frames,
+            tbptt_chunk_frames=tracking_config.tbptt_chunk_frames,
         )
         weight_dict = self.criterion.weight_dict
         loss = sum(loss_dict[name] * weight_dict[name] for name in loss_dict if name in weight_dict)
@@ -575,17 +924,76 @@ class RFDETRModelModule(LightningModule):
         self._step_lr_scheduler()
         self._accumulated_box_normalizer = None
 
+    def _decoded_frame_count(self, samples: Any, targets: Any) -> int:
+        """Return the number of model frame-forwards this microbatch performs.
+
+        A multi-frame tracking clip (``clip_length > 1``) forwards every frame in the
+        clip -- including burn-in frames, which still run the model even though they
+        carry no gradient -- so its contribution is ``batch_size * clip_length`` (PRD
+        Section 7.6 "decoded-video-frame budget"). Ordinary image batches and
+        degenerate length-1 clips report a flat 1 per microbatch instead of their
+        (possibly auto-probed) sample count, so non-curriculum training's LR schedule
+        stays byte-for-byte identical to the pre-curriculum step-counted schedule; see
+        ``configure_optimizers``'s matching ``_decoded_frames_per_optimizer_step``
+        reference.
+
+        Args:
+            samples: Either a NestedTensor image batch (stateless) or a sequence of
+                per-frame sample batches (a tracking clip).
+            targets: Either a list of per-image target dicts (stateless) or a sequence
+                of per-frame target-dict lists (a tracking clip), matching ``samples``.
+        """
+        if (
+            self.model_config.tracking.enabled
+            and isinstance(samples, (tuple, list))
+            and self.train_config.tracking.clip_length > 1
+        ):
+            return len(targets[0]) * len(samples)
+        return 1
+
+    def _advance_decoded_frame_progress(self) -> float:
+        """Commit pending decoded frames and return the step-equivalent schedule position.
+
+        PRD Section 7.6: "Learning-rate schedules advance in decoded-frame units, not
+        dataloader-step units." ``configure_optimizers()`` still computes ``lr_lambda``
+        in the step-equivalent domain (warmup_steps/total_steps derived from
+        ``estimated_stepping_batches``), so the frames accumulated since the last call
+        are converted back into that domain via ``_decoded_frames_per_optimizer_step``.
+        For a batch composition with a constant frame count per optimizer step (every
+        existing single-clip-length training run), this produces the exact same
+        +1-per-call progression as before; a curriculum or dataloader that mixes clip
+        lengths (or stateless images) within one run instead advances the schedule by
+        each step's true share of decoded compute.
+        """
+        self._decoded_frames_seen += self._pending_decoded_frames
+        self._pending_decoded_frames = 0
+        return self._decoded_frames_seen / self._decoded_frames_per_optimizer_step
+
     def _step_lr_scheduler(self) -> None:
-        """Step Lightning's scheduler object when one is configured."""
+        """Step Lightning's scheduler object using decoded-frame progress (manual-optimization path)."""
         try:
             scheduler = self.lr_schedulers()
         except (AttributeError, RuntimeError):
             return
         if scheduler is None:
             return
+        equivalent_step = self._advance_decoded_frame_progress()
         schedulers = scheduler if isinstance(scheduler, list) else [scheduler]
         for scheduler_item in schedulers:
-            scheduler_item.step()
+            scheduler_item.step(equivalent_step)
+
+    def lr_scheduler_step(self, scheduler: Any, metric: Any = None) -> None:
+        """Step using decoded-frame progress under automatic optimization (PRD Section 7.6).
+
+        Lightning calls this hook once per optimizer step for ``interval: "step"``
+        schedulers under automatic optimization (the detection/segmentation/tracking
+        path; the manual-optimization keypoint path steps explicitly via
+        ``_step_lr_scheduler`` instead and never reaches this hook). Delegating to the
+        same decoded-frame-aware progress keeps both optimization paths on identical
+        schedule semantics.
+        """
+        del metric
+        scheduler.step(self._advance_decoded_frame_progress())
 
     @staticmethod
     def _detach_results(results: list[dict[str, torch.Tensor]]) -> list[dict[str, torch.Tensor]]:
@@ -779,6 +1187,25 @@ class RFDETRModelModule(LightningModule):
         steps_per_epoch = max(1, total_steps // tc.epochs)
         warmup_steps = int(steps_per_epoch * tc.warmup_epochs)
 
+        # Decoded-frame LR progress (PRD Section 7.6): lr_lambda below still operates in
+        # the step-equivalent domain computed above, so _step_lr_scheduler /
+        # lr_scheduler_step convert accumulated decoded frames back into that domain via
+        # this reference. Only genuine multi-frame clips (clip_length > 1) carry a
+        # per-frame reference derived from the configured batch size (tracking rejects
+        # batch_size="auto", so this is always a concrete int there); every other run
+        # (including auto-batch-sized image training) uses grad_accum_steps as the
+        # reference, which -- paired with _decoded_frame_count returning a flat 1 per
+        # non-curriculum microbatch -- reproduces the exact +1-per-call progression the
+        # unscaled step counter always used.
+        effective_clip_length = tc.tracking.clip_length if self.model_config.tracking.enabled else 1
+        self._decoded_frames_per_optimizer_step = float(
+            int(tc.batch_size) * effective_clip_length * grad_accum_steps
+            if effective_clip_length > 1
+            else grad_accum_steps
+        )
+        self._decoded_frames_seen = 0.0
+        self._pending_decoded_frames = 0
+
         def lr_lambda(current_step: int) -> float:
             if current_step < warmup_steps:
                 return float(current_step) / float(max(1, warmup_steps))
@@ -923,6 +1350,22 @@ class RFDETRModelModule(LightningModule):
                 UserWarning,
                 stacklevel=2,
             )
+
+    def on_save_checkpoint(self, checkpoint: dict[str, Any]) -> None:
+        """Attach the authoritative architecture contract to native Lightning checkpoints."""
+        raw_model = getattr(self.model, "_orig_mod", self.model)
+        model_state = raw_model.state_dict()
+        checkpoint.update(
+            authoritative_checkpoint_metadata(
+                model_config=self.model_config,
+                train_config=self.train_config,
+                state_dict=model_state,
+                epoch=int(checkpoint.get("epoch", self.current_epoch)),
+                weight_flavor="regular",
+                source_checkpoint_hash_value=self._source_checkpoint_hash,
+            )
+        )
+        checkpoint["hyper_parameters"] = checkpoint["train_config"]
 
     def reinitialize_detection_head(self, num_classes: int) -> None:
         """Reinitialize the detection head for a new class count.

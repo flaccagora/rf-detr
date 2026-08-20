@@ -15,11 +15,10 @@ import torch
 from pytorch_lightning import Callback, LightningModule, Trainer
 from pytorch_lightning import __version__ as ptl_version
 from pytorch_lightning.trainer.states import TrainerFn
-from torch.utils.data import DataLoader, TensorDataset
-
-from rfdetr.config import RFDETRLargeDeprecatedConfig, RFDETRMediumConfig
+from rfdetr.config import RFDETRLargeDeprecatedConfig, RFDETRMediumConfig, RFDETRSmallConfig
 from rfdetr.training.callbacks.best_model import BestModelCallback, RFDETREarlyStopping
 from rfdetr.training.callbacks.ema import RFDETREMACallback
+from torch.utils.data import DataLoader, TensorDataset
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -165,6 +164,57 @@ class TestBestModelCallback:
         assert "test_loop" in loops, "test_loop missing — trainer.test(ckpt_path=...) will KeyError"
         assert "state_dict" in loops["validate_loop"]
         assert "state_dict" in loops["test_loop"]
+
+    def test_all_best_flavors_share_authoritative_checkpoint_metadata(self, tmp_path: Path) -> None:
+        """Regular, EMA, and selected-total checkpoints retain one architecture contract."""
+        source = tmp_path / "source.pth"
+        source.write_bytes(b"source detector")
+        model_config = RFDETRSmallConfig(
+            pretrain_weights=source,
+            num_classes=1,
+            group_detr=1,
+            class_schema={
+                "foreground_classes": [{"class_id": 0, "name": "person", "external_category_id": 0}],
+                "background_logit_index": 1,
+                "logit_activation": "sigmoid_independent",
+            },
+            tracking={"enabled": True, "max_active_tracks": 40, "discovery_reserve": 10},
+        )
+        callback = BestModelCallback(
+            output_dir=str(tmp_path),
+            monitor_ema="val/ema_mAP_50_95",
+            run_test=False,
+        )
+        trainer = _make_trainer({"val/mAP_50_95": 0.4, "val/ema_mAP_50_95": 0.6}, current_epoch=7)
+        pl_module = _make_pl_module()
+        pl_module.model_config = model_config
+        pl_module.train_config = {
+            "dataset_file": "video",
+            "group_detr": 13,
+            "ia_bce_loss": False,
+            "num_select": 100,
+            "segmentation_head": True,
+        }
+        pl_module._source_checkpoint_hash = "b" * 64
+
+        callback.on_validation_end(trainer, pl_module)
+        callback.on_fit_end(trainer, pl_module)
+
+        regular = torch.load(tmp_path / "checkpoint_best_regular.pth", weights_only=False)
+        ema = torch.load(tmp_path / "checkpoint_best_ema.pth", weights_only=False)
+        total = torch.load(tmp_path / "checkpoint_best_total.pth", weights_only=False)
+        for checkpoint in (regular, ema, total):
+            assert checkpoint["checkpoint_schema_version"] == 1
+            assert checkpoint["model_config_type"] == "RFDETRSmallConfig"
+            assert checkpoint["model_config"] == regular["model_config"]
+            assert checkpoint["class_schema"] == regular["model_config"]["class_schema"]
+            assert checkpoint["train_config"] == {"dataset_file": "video"}
+            assert checkpoint["args"] == {"dataset_file": "video"}
+            assert checkpoint["epoch"] == 7
+            assert checkpoint["source_checkpoint_hash"] == "b" * 64
+        assert regular["weight_flavor"] == "regular"
+        assert ema["weight_flavor"] == "ema"
+        assert total["weight_flavor"] == "ema"
 
     @pytest.mark.parametrize(
         "monitor_ema, metrics, checkpoint_file",

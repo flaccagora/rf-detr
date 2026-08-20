@@ -21,6 +21,7 @@ from pytorch_lightning import __version__ as ptl_version
 from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
 
 from rfdetr.training.callbacks.ema import RFDETREMACallback
+from rfdetr.training.checkpoint import authoritative_checkpoint_metadata, serialize_model_config, serialize_train_config
 from rfdetr.utilities.logger import get_logger
 from rfdetr.utilities.package import get_version
 from rfdetr.utilities.state_dict import _make_fit_loop_state, strip_checkpoint
@@ -31,8 +32,8 @@ logger = get_logger()
 class BestModelCallback(ModelCheckpoint):
     """Track best validation mAP and save best checkpoints during training.
 
-    Extends :class:`pytorch_lightning.callbacks.ModelCheckpoint` to save stripped ``{model, args, epoch}`` ``.pth``
-    files (instead of full ``.ckpt`` files) and to track a separate EMA checkpoint in parallel.
+    Extends :class:`pytorch_lightning.callbacks.ModelCheckpoint` to save self-describing, resume-capable ``.pth`` files
+    (instead of full ``.ckpt`` files) and to track a separate EMA checkpoint in parallel.
 
     At the end of training the overall winner (regular vs EMA, strict ``>`` for EMA) is copied to
     ``checkpoint_best_total.pth`` and optimizer/scheduler state is stripped via
@@ -238,30 +239,11 @@ class BestModelCallback(ModelCheckpoint):
         model_config = getattr(pl_module, "model_config", None)
         if model_config is None:
             return None
-        if isinstance(model_config, dict):
-            return model_config
-        model_dump = getattr(model_config, "model_dump", None)
-        if not callable(model_dump):
-            return None
-        dumped = model_dump()
-        if not isinstance(dumped, dict):
-            return None
-
-        # Sync schema-critical fields from live model weights.
         if state_dict is None:
             _orig = getattr(pl_module.model, "_orig_mod", None)
             raw = _orig if isinstance(_orig, torch.nn.Module) else pl_module.model
             state_dict = raw.state_dict()
-
-        _kp_mask = state_dict.get("_kp_active_mask")
-        if isinstance(_kp_mask, torch.Tensor) and _kp_mask.ndim == 2 and "num_keypoints_per_class" in dumped:
-            dumped["num_keypoints_per_class"] = [int(n) for n in _kp_mask.sum(dim=1).tolist()]
-
-        _ce_weight = state_dict.get("class_embed.weight")
-        if isinstance(_ce_weight, torch.Tensor) and _ce_weight.ndim == 2 and "num_classes" in dumped:
-            dumped["num_classes"] = _ce_weight.shape[0] - 1  # shape[0] = num_classes + 1 (background)
-
-        return dumped
+        return serialize_model_config(model_config, state_dict)
 
     @staticmethod
     def _resolve_model_name(pl_module: LightningModule) -> str | None:
@@ -368,19 +350,31 @@ class BestModelCallback(ModelCheckpoint):
             and getattr(train_config, "class_names", None) is None
         ):
             train_config = train_config.model_copy(update={"class_names": dataset_class_names})
-        args_dict = train_config.model_dump() if hasattr(train_config, "model_dump") else train_config
+        args_dict = serialize_train_config(train_config)
         model_name = self._resolve_model_name(pl_module)
         model_config_dict = self._serialize_model_config(pl_module, model_state_dict)
-        torch.save(
-            self._build_checkpoint_payload(
-                model_state_dict,
-                args_dict,
-                trainer,
-                model_name=model_name,
-                model_config_dict=model_config_dict,
-            ),
-            pth_path,
+        source_hash = getattr(pl_module, "_source_checkpoint_hash", None)
+        if not isinstance(source_hash, str):
+            source_hash = None
+        payload = self._build_checkpoint_payload(
+            model_state_dict,
+            args_dict,
+            trainer,
+            model_name=model_name,
+            model_config_dict=model_config_dict,
         )
+        if model_config_dict is not None:
+            payload.update(
+                authoritative_checkpoint_metadata(
+                    model_config=pl_module.model_config,
+                    train_config=train_config,
+                    state_dict=model_state_dict,
+                    epoch=trainer.current_epoch,
+                    weight_flavor="regular",
+                    source_checkpoint_hash_value=source_hash,
+                )
+            )
+        torch.save(payload, pth_path)
         self._last_global_step_saved = trainer.global_step
         monitor_value = trainer.callback_metrics.get(self.monitor)
         if torch.is_tensor(monitor_value):
@@ -468,21 +462,31 @@ class BestModelCallback(ModelCheckpoint):
                 and getattr(ema_train_config, "class_names", None) is None
             ):
                 ema_train_config = ema_train_config.model_copy(update={"class_names": dataset_class_names})
-            ema_args_dict = (
-                ema_train_config.model_dump() if hasattr(ema_train_config, "model_dump") else ema_train_config
-            )
+            ema_args_dict = serialize_train_config(ema_train_config)
             ema_model_name = self._resolve_model_name(pl_module)
             ema_model_config_dict = self._serialize_model_config(pl_module, ema_state_dict)
-            torch.save(
-                self._build_checkpoint_payload(
-                    ema_state_dict,
-                    ema_args_dict,
-                    trainer,
-                    model_name=ema_model_name,
-                    model_config_dict=ema_model_config_dict,
-                ),
-                self._output_dir / "checkpoint_best_ema.pth",
+            source_hash = getattr(pl_module, "_source_checkpoint_hash", None)
+            if not isinstance(source_hash, str):
+                source_hash = None
+            payload = self._build_checkpoint_payload(
+                ema_state_dict,
+                ema_args_dict,
+                trainer,
+                model_name=ema_model_name,
+                model_config_dict=ema_model_config_dict,
             )
+            if ema_model_config_dict is not None:
+                payload.update(
+                    authoritative_checkpoint_metadata(
+                        model_config=pl_module.model_config,
+                        train_config=ema_train_config,
+                        state_dict=ema_state_dict,
+                        epoch=trainer.current_epoch,
+                        weight_flavor="ema",
+                        source_checkpoint_hash_value=source_hash,
+                    )
+                )
+            torch.save(payload, self._output_dir / "checkpoint_best_ema.pth")
             logger.info(
                 "Best EMA mAP improved to %.4f (epoch %d)",
                 ema_val,

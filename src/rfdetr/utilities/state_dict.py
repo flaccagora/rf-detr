@@ -25,6 +25,17 @@ _PTL_COMPAT_KEYS = (
     "lr_schedulers",
 )
 
+_AUTHORITATIVE_CHECKPOINT_KEYS = (
+    "checkpoint_schema_version",
+    "model_config_type",
+    "model_config",
+    "class_schema",
+    "train_config",
+    "epoch",
+    "weight_flavor",
+    "source_checkpoint_hash",
+)
+
 
 def _raise_patch_size_mismatch(ckpt_patch_size: int, model_patch_size: int) -> None:
     """Raise a descriptive ValueError for a patch_size incompatibility.
@@ -131,7 +142,7 @@ def _make_fit_loop_state(epoch: int) -> dict:
 
 
 def strip_checkpoint(checkpoint: str | os.PathLike[str]) -> None:
-    """Strip a checkpoint file down to ``model``, ``args``, and PTL-compatible keys.
+    """Strip optimizer state while preserving model, authoritative metadata, and PTL compatibility.
 
     Preserves ``model_name`` (when present) so that ``RFDETR.from_checkpoint()`` can still resolve the model class from
     the stripped file.  Also preserves ``rfdetr_version`` (when present) for provenance tracking.
@@ -165,6 +176,9 @@ def strip_checkpoint(checkpoint: str | os.PathLike[str]) -> None:
     # Preserve rfdetr_version when present for provenance tracking.
     if "rfdetr_version" in state_dict:
         new_state_dict["rfdetr_version"] = state_dict["rfdetr_version"]
+    for key in _AUTHORITATIVE_CHECKPOINT_KEYS:
+        if key in state_dict:
+            new_state_dict[key] = state_dict[key]
     # Preserve PTL-compatible keys when present (written by BestModelCallback).
     for key in _PTL_COMPAT_KEYS:
         if key in state_dict:

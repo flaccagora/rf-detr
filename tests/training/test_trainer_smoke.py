@@ -140,6 +140,10 @@ def test_public_train_runs_one_recurrent_train_and_validation_batch(tmp_path: Pa
         num_classes=1,
         group_detr=1,
         tracking={"enabled": True},
+        class_schema={
+            "foreground_classes": [{"class_id": 0, "name": "object", "external_category_id": 0}],
+            "background_logit_index": 1,
+        },
     )
     train_config = TrainConfig(
         dataset_file="video",

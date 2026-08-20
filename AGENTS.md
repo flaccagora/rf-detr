@@ -255,6 +255,8 @@ result = subprocess.run(
 
 - Always check file existence before operations
 - Prevents errors when training is interrupted
+- Route every new checkpoint flavor through `authoritative_checkpoint_metadata`; `model_config` is the sole
+  architecture source, while duplicated deprecated architecture fields are removed from serialized train config.
 
 ### Type Hints & Docstrings
 

@@ -4,6 +4,9 @@
 # Licensed under the Apache License, Version 2.0 [see LICENSE for details]
 # ------------------------------------------------------------------------
 
+import hashlib
+import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -11,10 +14,10 @@ import pytest
 import torch
 from PIL import Image
 
-from rfdetr.config import TrackingConfig, TrackingSessionConfig
+from rfdetr.config import ClassSchema, ForegroundClass, TrackingConfig, TrackingPolicy, TrackingSessionConfig
 from rfdetr.detr import RFDETR
 from rfdetr.models.tracking import TrackingFrameOutput, TrackQueryState
-from rfdetr.tracking import TrackingSession, TrackingTiming
+from rfdetr.tracking import TrackingSession, TrackingTiming, load_tracking_policy
 
 
 class _TrackingModule(torch.nn.Module):
@@ -30,7 +33,7 @@ class _TrackingModule(torch.nn.Module):
         self.calls.append(prior_state)
         boxes = torch.tensor([[[0.5, 0.5, 0.5, 0.5], [0.1, 0.1, 0.1, 0.1]]], device=samples.device)
         return TrackingFrameOutput(
-            pred_logits=torch.tensor([[[5.0], [-5.0]]], device=samples.device),
+            pred_logits=torch.tensor([[[5.0, -5.0], [-5.0, 5.0]]], device=samples.device),
             pred_boxes=boxes,
             candidate_state=TrackQueryState(
                 torch.ones(1, 2, 3, device=samples.device),
@@ -41,7 +44,7 @@ class _TrackingModule(torch.nn.Module):
         )
 
 
-def _owner() -> RFDETR:
+def _owner(external_category_id: int = 0) -> RFDETR:
     """Build a weight-free RFDETR owner around the deterministic module."""
     owner = object.__new__(RFDETR)
     module = _TrackingModule()
@@ -49,6 +52,10 @@ def _owner() -> RFDETR:
         num_channels=3,
         num_queries=2,
         hidden_dim=3,
+        class_schema=ClassSchema(
+            foreground_classes=(ForegroundClass(class_id=0, name="person", external_category_id=external_category_id),),
+            background_logit_index=1,
+        ),
         tracking=TrackingConfig(enabled=True, max_active_tracks=1),
     )
     owner.model = SimpleNamespace(model=module, device=torch.device("cpu"), resolution=8)
@@ -68,11 +75,14 @@ class TestTrackingSession:
         second = owner.create_tracking_session()
         frame = np.zeros((6, 10, 3), dtype=np.uint8)
 
+        assert first.update(frame).tracker_id.tolist() == []
         assert first.update(frame).tracker_id.tolist() == [0]
+        assert second.update(frame).tracker_id.tolist() == []
         assert second.update(frame).tracker_id.tolist() == [0]
         assert first.update(frame).tracker_id.tolist() == [0]
 
         first.reset()
+        assert first.update(frame).tracker_id.tolist() == []
         assert first.update(frame).tracker_id.tolist() == [0]
         assert second.active_tracks[0].track_id == 0
 
@@ -88,19 +98,52 @@ class TestTrackingSession:
         """Retained detections expose slot-aligned IDs and pixel boxes."""
         session = TrackingSession(_owner(), TrackingSessionConfig())
 
-        detections = session.update(frame, frame_index=4, timestamp=1.5)
+        first = session.update(frame, frame_index=4, timestamp=1.4)
+        detections = session.update(frame, frame_index=5, timestamp=1.5)
 
+        assert first.tracker_id.tolist() == []
         assert detections.tracker_id.tolist() == [0]
         assert detections.class_id.tolist() == [0]
         assert detections.xyxy.tolist() == [[2.5, 1.5, 7.5, 4.5]]
-        assert detections.metadata["frame_index"] == 4
+        assert detections.metadata["frame_index"] == 5
         assert detections.metadata["timestamp"] == 1.5
+
+    def test_reset_cancels_tentative_birth_and_restarts_confirmation(self) -> None:
+        """Sequence reset discards private birth state as well as public identities."""
+        session = TrackingSession(_owner())
+        frame = torch.zeros(3, 6, 10)
+
+        assert session.update(frame).tracker_id.tolist() == []
+        session.reset()
+        assert session.update(frame).tracker_id.tolist() == []
+        assert session.update(frame).tracker_id.tolist() == [0]
+
+    def test_production_shaped_background_query_is_not_emitted(self) -> None:
+        """A two-logit no-object winner remains absent from public detections."""
+        session = TrackingSession(_owner())
+        first = session.update(torch.zeros(3, 6, 10))
+        detections = session.update(torch.zeros(3, 6, 10))
+
+        assert first.tracker_id.tolist() == []
+        assert detections.tracker_id.tolist() == [0]
+        assert detections.class_id.tolist() == [0]
+        assert session.last_frame_output is not None
+        assert session.last_frame_output.pred_logits.shape == (1, 2, 2)
+
+    def test_public_detections_use_external_foreground_category_ids(self) -> None:
+        """Session output maps the selected foreground logit through the authoritative schema."""
+        session = TrackingSession(_owner(external_category_id=7))
+        session.update(torch.zeros(3, 6, 10))
+        detections = session.update(torch.zeros(3, 6, 10))
+
+        assert detections.class_id.tolist() == [7]
 
     def test_stateless_prediction_between_updates_does_not_change_identity(self) -> None:
         """Ordinary image prediction remains independent from session state."""
         owner = _owner()
         session = owner.create_tracking_session()
         frame = torch.zeros(3, 6, 10)
+        session.update(frame)
         first = session.update(frame)
 
         owner.predict = lambda image: "stateless result"  # type: ignore[method-assign]
@@ -145,3 +188,162 @@ class TestTrackingSession:
 
         assert session.last_timing is None
         assert "timing" not in detections.metadata
+
+
+def _policy_fields(schema_hash: str, **overrides: object) -> dict[str, object]:
+    base = {
+        "foreground_schema_hash": schema_hash,
+        "activation_threshold": 0.5,
+        "continuation_threshold": 0.3,
+        "duplicate_iou_threshold": 0.7,
+        "max_missed_frames": 30,
+        "tentative_confirmation_hits": 2,
+        "tentative_confirmation_window_frames": 3,
+        "tentative_max_misses": 2,
+        "max_discovery_candidates_per_frame": 10,
+        "max_tentative_tracks": 10,
+        "max_active_tracks": 1,
+    }
+    base.update(overrides)
+    return base
+
+
+def _write_lock_file(path: Path, fields: dict[str, object], *, tamper: bool = False) -> None:
+    """Write a minimal ``tracking_policy.lock.json``-shaped artifact for loader tests."""
+    policy = TrackingPolicy(**fields)
+    payload = {
+        "schema_version": policy.schema_version,
+        "policy_hash": policy.sha256(),
+        "fields": json.loads(policy.canonical_json()),
+    }
+    payload["lock_hash"] = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+    if tamper:
+        payload["fields"]["activation_threshold"] = 0.999
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+
+
+class TestLoadTrackingPolicy:
+    """Loader for locked lifecycle policy artifacts (PRD US-013)."""
+
+    def test_round_trips_a_valid_lock_file(self, tmp_path: Path) -> None:
+        fields = _policy_fields("a" * 64)
+        lock_path = tmp_path / "tracking_policy.lock.json"
+        _write_lock_file(lock_path, fields)
+
+        policy = load_tracking_policy(lock_path)
+
+        assert policy == TrackingPolicy(**fields)
+
+    def test_rejects_unsupported_schema_version(self, tmp_path: Path) -> None:
+        lock_path = tmp_path / "tracking_policy.lock.json"
+        lock_path.write_text(json.dumps({"schema_version": "other"}))
+
+        with pytest.raises(ValueError, match="schema_version"):
+            load_tracking_policy(lock_path)
+
+    def test_rejects_tampered_fields(self, tmp_path: Path) -> None:
+        lock_path = tmp_path / "tracking_policy.lock.json"
+        _write_lock_file(lock_path, _policy_fields("a" * 64), tamper=True)
+
+        with pytest.raises(ValueError, match="does not match|modified"):
+            load_tracking_policy(lock_path)
+
+
+class TestTrackingSessionLockedPolicy:
+    """Constructing sessions from a locked, versioned policy contract (PRD US-013)."""
+
+    def test_session_applies_locked_policy_and_exposes_its_hash(self) -> None:
+        owner = _owner()
+        schema_hash = owner.model_config.class_schema.sha256()
+        policy = TrackingPolicy(**_policy_fields(schema_hash, activation_threshold=0.42))
+
+        session = TrackingSession(owner, policy=policy)
+
+        assert session.policy_hash == policy.sha256()
+
+    def test_session_without_a_policy_has_no_policy_hash(self) -> None:
+        session = TrackingSession(_owner())
+
+        assert session.policy_hash is None
+
+    def test_config_and_policy_are_mutually_exclusive(self) -> None:
+        owner = _owner()
+        schema_hash = owner.model_config.class_schema.sha256()
+        policy = TrackingPolicy(**_policy_fields(schema_hash))
+
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            TrackingSession(owner, TrackingSessionConfig(), policy=policy)
+
+    def test_rejects_a_policy_calibrated_for_a_different_class_schema(self) -> None:
+        owner = _owner()
+        policy = TrackingPolicy(**_policy_fields("f" * 64))
+
+        with pytest.raises(ValueError, match="foreground_schema_hash"):
+            TrackingSession(owner, policy=policy)
+
+    def test_rejects_a_policy_calibrated_for_a_different_durable_capacity(self) -> None:
+        owner = _owner()
+        schema_hash = owner.model_config.class_schema.sha256()
+        policy = TrackingPolicy(**_policy_fields(schema_hash, max_active_tracks=40))
+
+        with pytest.raises(ValueError, match="max_active_tracks"):
+            TrackingSession(owner, policy=policy)
+
+    def test_deployment_entry_point_loads_the_same_versioned_policy_type(self, tmp_path: Path) -> None:
+        """``create_tracking_session(policy_lock_path=...)`` is the deployment entry point."""
+        owner = _owner()
+        schema_hash = owner.model_config.class_schema.sha256()
+        fields = _policy_fields(schema_hash, activation_threshold=0.42)
+        lock_path = tmp_path / "tracking_policy.lock.json"
+        _write_lock_file(lock_path, fields)
+
+        session = owner.create_tracking_session(policy_lock_path=lock_path)
+
+        assert session.policy_hash == TrackingPolicy(**fields).sha256()
+
+    def test_deployment_config_and_policy_lock_path_are_mutually_exclusive(self, tmp_path: Path) -> None:
+        owner = _owner()
+        schema_hash = owner.model_config.class_schema.sha256()
+        lock_path = tmp_path / "tracking_policy.lock.json"
+        _write_lock_file(lock_path, _policy_fields(schema_hash))
+
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            owner.create_tracking_session(TrackingSessionConfig(), policy_lock_path=lock_path)
+
+    def test_validation_and_deployment_entry_points_produce_frame_for_frame_identical_output(
+        self, tmp_path: Path
+    ) -> None:
+        """A locked policy drives identical results whether loaded for validation or deployment.
+
+        Chronological validation (e.g. ``evaluate_tracking_checkpoint``) and the
+        deployment entry point (``RFDETR.create_tracking_session``) both end up
+        constructing a ``TrackingSession`` from the same ``TrackingPolicy``
+        deserialized out of one locked artifact. This proves neither path can
+        silently diverge on thresholds, capacity, or class schema.
+        """
+        owner = _owner()
+        schema_hash = owner.model_config.class_schema.sha256()
+        fields = _policy_fields(schema_hash)
+        lock_path = tmp_path / "tracking_policy.lock.json"
+        _write_lock_file(lock_path, fields)
+        frames = [np.zeros((6, 10, 3), dtype=np.uint8) for _ in range(4)]
+
+        # Deployment entry point.
+        deployment_session = owner.create_tracking_session(policy_lock_path=lock_path)
+        deployment_results = [deployment_session.update(frame) for frame in frames]
+
+        # Validation entry point: loads the same lock file through the same
+        # loader and constructs TrackingSession directly, mirroring what
+        # chronological validation does internally.
+        validation_policy = load_tracking_policy(lock_path)
+        validation_session = TrackingSession(_owner(), policy=validation_policy)
+        validation_results = [validation_session.update(frame) for frame in frames]
+
+        assert deployment_session.policy_hash == validation_session.policy_hash
+        for deployment_result, validation_result in zip(deployment_results, validation_results, strict=True):
+            assert deployment_result.tracker_id.tolist() == validation_result.tracker_id.tolist()
+            assert deployment_result.class_id.tolist() == validation_result.class_id.tolist()
+            assert deployment_result.xyxy.tolist() == validation_result.xyxy.tolist()
+            assert deployment_result.confidence.tolist() == validation_result.confidence.tolist()

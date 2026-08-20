@@ -139,7 +139,15 @@ class TestBuildCriterionFromConfig:
         """Tracking-enabled fine-tuning must select the criterion that consumes sequence assignments."""
         from rfdetr.models.criterion import TrackingSetCriterion
 
-        mc = RFDETRBaseConfig(num_classes=80, group_detr=1, tracking={"enabled": True})
+        mc = RFDETRBaseConfig(
+            num_classes=1,
+            group_detr=1,
+            tracking={"enabled": True},
+            class_schema={
+                "foreground_classes": [{"class_id": 0, "name": "object", "external_category_id": 0}],
+                "background_logit_index": 1,
+            },
+        )
         tc = TrainConfig(dataset_dir="/tmp")
 
         criterion, _ = build_criterion_from_config(mc, tc)

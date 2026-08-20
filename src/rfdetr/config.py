@@ -5,6 +5,8 @@
 # ------------------------------------------------------------------------
 
 
+import hashlib
+import json
 import os
 import warnings
 from collections.abc import Mapping
@@ -99,6 +101,75 @@ class BaseConfig(BaseModel):
         raise ValueError(f"Unknown attribute: '{name}'.")
 
 
+class ForegroundClass(BaseConfig):
+    """One foreground logit and its public dataset category."""
+
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid", validate_assignment=True, frozen=True)
+
+    class_id: int = Field(ge=0, strict=True)
+    name: str = Field(min_length=1)
+    external_category_id: int = Field(ge=0, strict=True)
+
+    @field_validator("name")
+    @classmethod
+    def _strip_name(cls, value: str) -> str:
+        """Return a non-empty canonical class name."""
+        name = value.strip()
+        if not name:
+            raise ValueError("name must not be blank")
+        return name
+
+
+class ClassSchema(BaseConfig):
+    """Authoritative mapping between detector logits and public categories.
+
+    ``foreground_classes`` identifies every object logit. A single optional
+    ``background_logit_index`` identifies the no-object logit; ``None`` means
+    the head has no background slot.
+    """
+
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid", validate_assignment=True, frozen=True)
+
+    schema_version: Literal[1] = 1
+    foreground_classes: tuple[ForegroundClass, ...] = Field(min_length=1)
+    background_logit_index: int | None = Field(default=None, ge=0, strict=True)
+    logit_activation: Literal["sigmoid_independent", "softmax_exclusive"] = "sigmoid_independent"
+
+    @field_validator("foreground_classes")
+    @classmethod
+    def _canonicalize_foreground_classes(cls, classes: tuple[ForegroundClass, ...]) -> tuple[ForegroundClass, ...]:
+        """Validate unique mappings and sort them by model class ID."""
+        class_ids = [entry.class_id for entry in classes]
+        if len(class_ids) != len(set(class_ids)):
+            raise ValueError("foreground class_id values must be unique")
+        return tuple(sorted(classes, key=lambda entry: entry.class_id))
+
+    @model_validator(mode="after")
+    def _validate_background_role(self) -> "ClassSchema":
+        """Reject a logit declared as both foreground and background."""
+        if self.background_logit_index in self.foreground_class_ids:
+            raise ValueError("background_logit_index must not identify a foreground class")
+        return self
+
+    @property
+    def foreground_class_ids(self) -> tuple[int, ...]:
+        """Return foreground model class IDs in canonical order."""
+        return tuple(entry.class_id for entry in self.foreground_classes)
+
+    @property
+    def external_category_mapping(self) -> dict[int, int]:
+        """Return model class ID to public dataset category ID mappings."""
+        return {entry.class_id: entry.external_category_id for entry in self.foreground_classes}
+
+    def canonical_json(self) -> str:
+        """Serialize content deterministically for artifacts and hashing."""
+        return json.dumps(self.model_dump(mode="json"), ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+    def sha256(self) -> str:
+        """Return the stable SHA-256 digest of :meth:`canonical_json`."""
+        return hashlib.sha256(self.canonical_json().encode("utf-8")).hexdigest()
+
+
 class TrackingConfig(BaseConfig):
     """Persistent-query architecture and fixed-capacity configuration.
 
@@ -129,35 +200,6 @@ class TrackingConfig(BaseConfig):
         return num_queries - self.discovery_reserve
 
 
-class TrackingTrainConfig(BaseConfig):
-    """Settings that apply only to causal video-training clips.
-
-    Attributes:
-        clip_length: Number of chronological frames in each training clip. A
-            value of one preserves ordinary image-training behavior.
-        clip_stride: Number of source frames between adjacent clip starts.
-        annotation_path: Dataset-relative or absolute COCO-video annotation
-            path. ``None`` lets the dataset adapter use its split convention.
-        detach_state_between_frames: Whether recurrent query state is detached
-            between adjacent frames.
-        lifecycle_mode: Policy used to commit state while training.
-    """
-
-    clip_length: int = Field(default=1, ge=1)
-    clip_stride: int = Field(default=1, ge=1)
-    annotation_path: str | None = None
-    detach_state_between_frames: bool = False
-    lifecycle_mode: Literal["assignment_guided", "inference_like"] = "assignment_guided"
-
-    @field_validator("annotation_path", mode="before")
-    @classmethod
-    def _coerce_annotation_path(cls, value: PathLikeStr | None) -> str | None:
-        """Store annotation paths as strings for JSON and checkpoint serialization."""
-        if value is None:
-            return None
-        return os.fspath(value)
-
-
 class TrackingSessionConfig(BaseConfig):
     """Inference lifecycle policy for a single tracking session.
 
@@ -170,6 +212,70 @@ class TrackingSessionConfig(BaseConfig):
             treated as a duplicate.
         max_missed_frames: Number of missed source frames tolerated before a
             suspended track is terminated.
+        tentative_confirmation_hits: Qualifying discovery hits required before
+            a tentative track receives a public identity.
+        tentative_confirmation_window_frames: Inclusive source-frame window,
+            beginning at the first hit, in which confirmation must occur.
+        tentative_max_misses: Misses tolerated while tentative; reaching this
+            count cancels the tentative track.
+        max_discovery_candidates_per_frame: Highest-scoring foreground
+            discoveries considered for birth in one frame. The limit is
+            deliberately independent of the decoder query count so that
+            hundreds of queries cannot create hundreds of births.
+        max_tentative_tracks: Maximum tentative slots that may coexist. This
+            capacity is separate from the durable active/suspended capacity.
+        reassociation_enabled: Whether a foreground discovery may reassociate
+            with (revive) a suspended track's identity instead of being
+            screened only as a candidate for a new tentative/active birth
+            (PRD US-024). Disabled by default, which keeps the required
+            same-slot-suspended recovery as the only way a suspended track
+            regains activity: this discovery-to-suspended experiment is a
+            conditionally authorized architecture mechanism, not part of the
+            locked baseline lifecycle. When enabled, reassociation is
+            evaluated only against suspended tracks -- never active or
+            tentative ones -- and takes priority over duplicate suppression.
+        reassociation_iou_threshold: Minimum IoU between a discovery
+            candidate and a suspended track's stale reference box for the
+            discovery to reassociate with that suspended track's identity.
+            Ignored when ``reassociation_enabled`` is ``False``.
+        motion_reference_prediction_enabled: Whether a suspended track's
+            reference box is extrapolated from its last reliable box and an
+            elapsed-time/per-frame velocity estimate instead of being left
+            stale (PRD US-025). Disabled by default, which keeps the
+            required baseline exactly as before: a suspended slot's
+            reference box (and therefore its decoder query position and its
+            IoU against new discoveries) does not move until the track
+            recovers or is recycled. This is a conditionally authorized
+            architecture mechanism, not part of the locked baseline
+            lifecycle. Enabling it changes only the reference box fed
+            forward for suspended slots; latest-query feature recurrence
+            and every lifecycle status transition are unchanged.
+        identity_memory_enabled: Whether each active/suspended slot keeps a
+            finite, quality-weighted bank of its own reliable committed
+            query features and uses it to veto a continuation whose
+            candidate feature resembles another same-class occupied slot's
+            memory more than its own (PRD US-026). Disabled by default,
+            which keeps the required baseline exactly as before: no slot
+            ever records ``identity_memory``, and a continuation is
+            accepted whenever its score alone clears
+            ``continuation_threshold``. This is a conditionally authorized
+            architecture mechanism, not part of the locked baseline
+            lifecycle. It adds no motion prediction, no
+            discovery-to-suspended reassociation, and no learned lifecycle
+            head -- only a bounded appearance-memory veto on the existing
+            continuation decision.
+        identity_memory_length: Maximum number of observations retained in
+            one slot's identity-memory bank. The bank keeps the
+            highest-weight observations it has ever been offered, so a
+            track's identity representation is anchored to its most
+            confident evidence rather than the most recent. Ignored when
+            ``identity_memory_enabled`` is ``False``.
+        identity_memory_reliable_threshold: Minimum continuation score
+            required for a committed feature to be folded into a slot's
+            identity memory. Deliberately independent of
+            ``continuation_threshold`` so memory can require stronger
+            evidence than the bar for merely continuing a track. Ignored
+            when ``identity_memory_enabled`` is ``False``.
         collect_timing: Collect synchronized per-frame latency measurements.
             Disabled by default to avoid adding measurement overhead.
     """
@@ -178,7 +284,246 @@ class TrackingSessionConfig(BaseConfig):
     continuation_threshold: float = Field(default=0.3, ge=0.0, le=1.0)
     duplicate_iou_threshold: float = Field(default=0.7, ge=0.0, le=1.0)
     max_missed_frames: int = Field(default=30, ge=0)
+    tentative_confirmation_hits: int = Field(default=2, ge=1)
+    tentative_confirmation_window_frames: int = Field(default=3, ge=1)
+    tentative_max_misses: int = Field(default=2, ge=1)
+    max_discovery_candidates_per_frame: int = Field(default=10, ge=1)
+    max_tentative_tracks: int = Field(default=10, ge=1)
+    reassociation_enabled: bool = False
+    reassociation_iou_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
+    motion_reference_prediction_enabled: bool = False
+    identity_memory_enabled: bool = False
+    identity_memory_length: int = Field(default=8, ge=1)
+    identity_memory_reliable_threshold: float = Field(default=0.7, ge=0.0, le=1.0)
     collect_timing: bool = False
+
+    @model_validator(mode="after")
+    def _validate_tentative_confirmation(self) -> "TrackingSessionConfig":
+        if self.tentative_confirmation_hits > self.tentative_confirmation_window_frames:
+            raise ValueError("tentative confirmation hits cannot exceed the confirmation window")
+        return self
+
+
+class TrackingTrainConfig(BaseConfig):
+    """Settings that apply only to causal video-training clips.
+
+    Attributes:
+        clip_length: Number of chronological frames in each training clip. A
+            value of one preserves ordinary image-training behavior.
+        clip_stride: Number of source frames between adjacent clip starts.
+        annotation_path: Dataset-relative or absolute COCO-video annotation
+            path. ``None`` lets the dataset adapter use its split convention.
+        detach_state_between_frames: Whether recurrent query state is detached
+            between adjacent frames.
+        burn_in_frames: Leading frames of each clip that are unrolled under
+            ``torch.no_grad()`` before any supervised (loss-producing) frame
+            (PRD Section 7.6). Burn-in always commits state through the
+            prediction-driven inference-like lifecycle, regardless of
+            ``lifecycle_mode``, so the model enters the supervised suffix with
+            a long, causally realistic state history it was never allowed to
+            backpropagate through.
+        supervised_frames: Trailing frames of each clip, following burn-in,
+            that contribute to the loss. Defaults to ``clip_length -
+            burn_in_frames`` when not set explicitly. Must satisfy
+            ``burn_in_frames + supervised_frames == clip_length``.
+        tbptt_chunk_frames: Number of consecutive supervised frames
+            backpropagated together before recurrent state is detached
+            (truncated backpropagation through time). ``None`` keeps the
+            entire supervised suffix as one chunk, matching the pre-curriculum
+            single-graph behavior. No gradient ever flows across a chunk
+            boundary or past the end of the clip.
+        lifecycle_mode: Policy used to commit state while training. In
+            ``"assignment_guided"`` mode, ground-truth identity assignment
+            drives which queries carry a track between frames -- the matched
+            control described by PRD US-018/US-022. In ``"inference_like"``
+            mode, state commitment runs the exact same
+            :func:`rfdetr.tracking.lifecycle.transition_lifecycle` state
+            machine used by deployment, so weak discoveries, suspensions,
+            recoveries, and terminations are the model's own mistakes rather
+            than ground-truth-repaired state; ground truth is still used to
+            build the loss via ``identity_aware_sequence_assignment``, but it
+            never overrides the committed lifecycle state.
+        lifecycle: Lifecycle thresholds and capacities applied while
+            committing state in ``"inference_like"`` mode. Ignored in
+            ``"assignment_guided"`` mode.
+        tracking_eval_interval_epochs: Run complete-sequence chronological
+            tracking evaluation every N epochs (PRD Section 7.5), independent
+            of ``TrainConfig.eval_interval`` (which governs the per-epoch
+            stateless image mAP). The final epoch is always evaluated
+            regardless of this interval.
+        false_positive_injection_enabled: Whether the ``"inference_like"``
+            commit path forces a bounded number of ground-truth-unmatched
+            discovery candidates to activate as tracks each frame (PRD
+            US-019), exposing training to the kind of committed false
+            positives real inference produces. Ignored in
+            ``"assignment_guided"`` mode.
+        false_positive_injection_probability: Per-candidate probability that
+            an eligible unmatched discovery is injected, applied before the
+            per-sample cap.
+        false_positive_injection_max_per_sample: Maximum unmatched discovery
+            candidates injected across an entire clip for one batch item.
+        query_dropout_enabled: Whether the ``"inference_like"`` commit path
+            forces a random subset of currently active slots to look like a
+            missed detection each frame (PRD US-019), exposing training to
+            the kind of committed false negatives real inference produces.
+            Ignored in ``"assignment_guided"`` mode.
+        query_dropout_probability: Per-active-slot probability of dropout
+            each frame. Never drops every active slot in one frame for one
+            batch item.
+        error_exposure_seed: Seed for the deterministic generator that drives
+            false-positive injection and query dropout sampling, independent
+            of any other training randomness.
+    """
+
+    clip_length: int = Field(default=1, ge=1)
+    clip_stride: int = Field(default=1, ge=1)
+    annotation_path: str | None = None
+    detach_state_between_frames: bool = False
+    burn_in_frames: int = Field(default=0, ge=0)
+    supervised_frames: int = Field(default=1, ge=1)
+    tbptt_chunk_frames: int | None = Field(default=None, ge=1)
+    lifecycle_mode: Literal["assignment_guided", "inference_like"] = "assignment_guided"
+    lifecycle: TrackingSessionConfig = Field(default_factory=TrackingSessionConfig)
+    tracking_eval_interval_epochs: int = Field(default=5, ge=1)
+    false_positive_injection_enabled: bool = False
+    false_positive_injection_probability: float = Field(default=0.10, ge=0.0, le=1.0)
+    false_positive_injection_max_per_sample: int = Field(default=2, ge=0)
+    query_dropout_enabled: bool = False
+    query_dropout_probability: float = Field(default=0.10, ge=0.0, le=1.0)
+    error_exposure_seed: int = Field(default=0, ge=0)
+
+    @field_validator("annotation_path", mode="before")
+    @classmethod
+    def _coerce_annotation_path(cls, value: PathLikeStr | None) -> str | None:
+        """Store annotation paths as strings for JSON and checkpoint serialization."""
+        if value is None:
+            return None
+        return os.fspath(value)
+
+    @model_validator(mode="after")
+    def _default_supervised_frames(self) -> "TrackingTrainConfig":
+        """Default ``supervised_frames`` to ``clip_length - burn_in_frames`` when not set explicitly.
+
+        This keeps every existing configuration that only sets ``clip_length`` (with no burn-in or
+        TBPTT curriculum) behaving exactly as before: the whole clip stays supervised.
+        """
+        if "supervised_frames" not in self.model_fields_set:
+            self.supervised_frames = self.clip_length - self.burn_in_frames
+        return self
+
+    @model_validator(mode="after")
+    def _validate_burn_in_supervised_split(self) -> "TrackingTrainConfig":
+        """Require the burn-in and supervised suffix to exactly partition the clip (PRD Section 7.6)."""
+        if self.burn_in_frames + self.supervised_frames != self.clip_length:
+            raise ValueError(
+                f"burn_in_frames ({self.burn_in_frames}) + supervised_frames ({self.supervised_frames}) "
+                f"must equal clip_length ({self.clip_length})"
+            )
+        return self
+
+
+TRACKING_POLICY_LOCK_SCHEMA_VERSION = "clevis.rfdetr-tracking-policy-lock-v1"
+TRACKING_POLICY_RECOVERY_MODE = "same_slot_suspended"
+
+
+class TrackingPolicy(BaseConfig):
+    """Immutable, versioned lifecycle policy contract for one deployable tracker.
+
+    ``TrackingSession``, chronological validation, benchmark CLIs, and
+    deployment entry points all deserialize this exact type from a locked
+    policy artifact (e.g. ``tracking_policy.lock.json``), so none of them can
+    silently apply their own default thresholds. Unlike ``TrackingSessionConfig``
+    -- which is a bare set of tunable lifecycle knobs used freely during
+    calibration sweeps and replay screening -- a ``TrackingPolicy`` also pins
+    the foreground class schema it was calibrated against, the durable-track
+    capacity, and the recovery mode, so a locked policy can never be silently
+    applied to an incompatible model or capacity.
+
+    Attributes:
+        schema_version: Locked policy artifact schema version.
+        foreground_schema_hash: ``ClassSchema.sha256()`` of the class schema
+            this policy was calibrated against. Deployment must refuse to
+            apply a policy whose schema hash does not match the loaded model.
+        activation_threshold: Minimum confidence for activating a discovery
+            query as a track.
+        continuation_threshold: Minimum confidence for committing an updated
+            state for an existing track.
+        duplicate_iou_threshold: IoU above which a same-class discovery is
+            treated as a duplicate.
+        max_missed_frames: Number of missed source frames tolerated before a
+            suspended track is terminated.
+        tentative_confirmation_hits: Qualifying discovery hits required before
+            a tentative track receives a public identity.
+        tentative_confirmation_window_frames: Inclusive source-frame window,
+            beginning at the first hit, in which confirmation must occur.
+        tentative_max_misses: Misses tolerated while tentative; reaching this
+            count cancels the tentative track.
+        max_discovery_candidates_per_frame: Highest-scoring foreground
+            discoveries considered for birth in one frame.
+        max_tentative_tracks: Maximum tentative slots that may coexist.
+        max_active_tracks: Durable active/suspended track capacity this
+            policy was calibrated against.
+        recovery_mode: Suspended-track recovery strategy. Only same-slot
+            recovery is locked into this deployable policy contract; the
+            discovery-to-suspended reassociation mechanism (PRD US-024,
+            ``TrackingSessionConfig.reassociation_enabled``) exists only as a
+            separate, conditionally authorized experiment until it earns
+            promotion into the locked policy field set, so this field cannot
+            be silently applied to a policy that was never validated
+            against it. The same applies to the elapsed-time/velocity
+            reference-prediction mechanism (PRD US-025,
+            ``TrackingSessionConfig.motion_reference_prediction_enabled``)
+            and the bounded identity-memory mechanism (PRD US-026,
+            ``TrackingSessionConfig.identity_memory_enabled``): neither
+            field exists on this contract, so ``to_session_config`` always
+            produces a session with both disabled until one earns
+            promotion.
+    """
+
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid", validate_assignment=True, frozen=True)
+
+    schema_version: Literal["clevis.rfdetr-tracking-policy-lock-v1"] = TRACKING_POLICY_LOCK_SCHEMA_VERSION
+    foreground_schema_hash: str = Field(min_length=1)
+    activation_threshold: float = Field(ge=0.0, le=1.0)
+    continuation_threshold: float = Field(ge=0.0, le=1.0)
+    duplicate_iou_threshold: float = Field(ge=0.0, le=1.0)
+    max_missed_frames: int = Field(ge=0)
+    tentative_confirmation_hits: int = Field(ge=1)
+    tentative_confirmation_window_frames: int = Field(ge=1)
+    tentative_max_misses: int = Field(ge=1)
+    max_discovery_candidates_per_frame: int = Field(ge=1)
+    max_tentative_tracks: int = Field(ge=1)
+    max_active_tracks: int = Field(ge=1)
+    recovery_mode: Literal["same_slot_suspended"] = TRACKING_POLICY_RECOVERY_MODE
+
+    @model_validator(mode="after")
+    def _validate_tentative_confirmation(self) -> "TrackingPolicy":
+        if self.tentative_confirmation_hits > self.tentative_confirmation_window_frames:
+            raise ValueError("tentative confirmation hits cannot exceed the confirmation window")
+        return self
+
+    def canonical_json(self) -> str:
+        """Serialize content deterministically for artifacts and hashing."""
+        return json.dumps(self.model_dump(mode="json"), ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+    def sha256(self) -> str:
+        """Return the stable SHA-256 digest of :meth:`canonical_json`."""
+        return hashlib.sha256(self.canonical_json().encode("utf-8")).hexdigest()
+
+    def to_session_config(self, *, collect_timing: bool = False) -> "TrackingSessionConfig":
+        """Return the ``TrackingSessionConfig`` this policy's thresholds imply."""
+        return TrackingSessionConfig(
+            activation_threshold=self.activation_threshold,
+            continuation_threshold=self.continuation_threshold,
+            duplicate_iou_threshold=self.duplicate_iou_threshold,
+            max_missed_frames=self.max_missed_frames,
+            tentative_confirmation_hits=self.tentative_confirmation_hits,
+            tentative_confirmation_window_frames=self.tentative_confirmation_window_frames,
+            tentative_max_misses=self.tentative_max_misses,
+            max_discovery_candidates_per_frame=self.max_discovery_candidates_per_frame,
+            max_tentative_tracks=self.max_tentative_tracks,
+            collect_timing=collect_timing,
+        )
 
 
 class ModelConfig(BaseConfig):
@@ -221,6 +566,8 @@ class ModelConfig(BaseConfig):
         device: Target device string (e.g. ``"cuda"``, ``"cpu"``). Auto-detected if not set.
         gradient_checkpointing: Trade compute for memory by checkpointing activations. Defaults
             to ``False``.
+        class_schema: Authoritative foreground, background, category, and
+            logit-activation contract. Required for persistent tracking.
         tracking: Persistent-query architecture and capacity settings. Tracking
             is disabled by default.
     """
@@ -281,6 +628,7 @@ class ModelConfig(BaseConfig):
             "without inspecting ``pretrain_weights``."
         ),
     )
+    class_schema: ClassSchema | None = None
     tracking: TrackingConfig = Field(default_factory=TrackingConfig)
 
     @model_validator(mode="after")
@@ -312,6 +660,23 @@ class ModelConfig(BaseConfig):
                 "Tracking max_active_tracks "
                 f"({active_capacity}) plus discovery_reserve ({self.tracking.discovery_reserve}) "
                 f"must not exceed num_queries ({self.num_queries})."
+            )
+        if self.class_schema is None:
+            raise ValueError(
+                "Persistent-query tracking requires class_schema with explicit foreground and background/no-object "
+                "logit roles. Ambiguous temporal checkpoints must be migrated or loaded with a verified class_schema."
+            )
+        expected_class_ids = tuple(range(self.num_classes))
+        if self.class_schema.foreground_class_ids != expected_class_ids:
+            raise ValueError(
+                "class_schema foreground class IDs must exactly match contiguous model logits "
+                f"{expected_class_ids}; got {self.class_schema.foreground_class_ids}."
+            )
+        background_index = self.class_schema.background_logit_index
+        if background_index is not None and background_index != self.num_classes:
+            raise ValueError(
+                "class_schema background_logit_index must follow the foreground logits at "
+                f"index {self.num_classes}; got {background_index}."
             )
         return self
 

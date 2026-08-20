@@ -23,6 +23,7 @@ from rfdetr.training.callbacks.best_model import BestModelCallback, RFDETREarlyS
 from rfdetr.training.callbacks.coco_eval import COCOEvalCallback
 from rfdetr.training.callbacks.drop_schedule import DropPathCallback
 from rfdetr.training.callbacks.ema import RFDETREMACallback
+from rfdetr.training.callbacks.tracking_eval import TrackingEvalCallback
 
 
 def _mc(**kwargs):
@@ -275,6 +276,28 @@ class TestBuildTrainerCallbacks:
         trainer = build_trainer(_tc(tmp_path, early_stopping=False), _mc())
         types = [type(cb) for cb in trainer.callbacks]
         assert RFDETREarlyStopping not in types
+
+    def test_no_tracking_eval_callback_when_not_supplied(self, tmp_path):
+        """The default (None) tracking_eval_callback adds nothing to the callback stack."""
+        trainer = build_trainer(_tc(tmp_path), _mc())
+        assert not any(isinstance(cb, TrackingEvalCallback) for cb in trainer.callbacks)
+
+    def test_tracking_eval_callback_appended_additively(self, tmp_path):
+        """A caller-supplied tracking_eval_callback is appended without displacing built-in callbacks."""
+        tracking_eval_callback = TrackingEvalCallback(
+            output_dir=str(tmp_path / "out"), interval_epochs=5, eval_fn=lambda request: None
+        )
+        trainer = build_trainer(
+            _tc(tmp_path, use_ema=True, early_stopping=True),
+            _mc(),
+            tracking_eval_callback=tracking_eval_callback,
+        )
+        types = [type(cb) for cb in trainer.callbacks]
+        assert tracking_eval_callback in trainer.callbacks
+        assert COCOEvalCallback in types
+        assert BestModelCallback in types
+        assert RFDETREMACallback in types
+        assert RFDETREarlyStopping in types
 
     def test_segmentation_config_accepted(self, tmp_path):
         """SegmentationTrainConfig is accepted without error."""
