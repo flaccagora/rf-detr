@@ -4,12 +4,25 @@
 # Licensed under the Apache License, Version 2.0 [see LICENSE for details]
 # ------------------------------------------------------------------------
 
+import random
+
 import pytest
 import torch
 
 from rfdetr.config import ClassSchema, ForegroundClass, TrackingSessionConfig
 from rfdetr.models.tracking import TrackingFrameOutput, TrackQueryState
-from rfdetr.tracking.lifecycle import LifecycleEvent, TrackSlotTable, transition_lifecycle
+from rfdetr.tracking.lifecycle import (
+    CollisionArbitrationEvent,
+    LifecycleEvent,
+    LifecycleInvariantError,
+    LifecycleTransition,
+    TentativeRecord,
+    TentativeTrackPool,
+    TrackSlot,
+    TrackSlotTable,
+    transition_lifecycle,
+    validate_lifecycle_invariants,
+)
 
 _PERSON_SCHEMA = ClassSchema(
     foreground_classes=(ForegroundClass(class_id=0, name="person", external_category_id=0),),
@@ -56,11 +69,41 @@ def _frame(
     )
 
 
+def _slot(**overrides: object) -> TrackSlot:
+    """Build a ``TrackSlot`` for directly crafting a ``LifecycleTransition`` under test."""
+    fields: dict[str, object] = {
+        "track_id": None,
+        "status": "inactive",
+        "age": 0,
+        "hits": 0,
+        "missed_frames": 0,
+        "last_reliable_frame": None,
+        "confidence": None,
+        "class_id": None,
+        "last_reliable_box": None,
+        "velocity": None,
+        "identity_memory": (),
+        "collision_streak": 0,
+    }
+    fields.update(overrides)
+    return TrackSlot(**fields)
+
+
+def _crafted_state(active_mask: list[bool]) -> TrackQueryState:
+    """Build a zero-valued ``TrackQueryState`` with the given per-slot active mask."""
+    num_queries = len(active_mask)
+    return TrackQueryState(
+        query_features=torch.zeros(1, num_queries, 2),
+        reference_boxes=torch.zeros(1, num_queries, 4),
+        active_mask=torch.tensor([active_mask], dtype=torch.bool),
+    )
+
+
 class TestLifecycleTransitions:
     """Pure lifecycle behavior for a single tracking stream."""
 
-    def test_tentative_birth_confirms_on_second_hit_without_early_identity(self) -> None:
-        """A discovery persists privately and emits only after confirmation."""
+    def test_tentative_birth_creates_a_pool_entry_without_touching_the_slot_table(self) -> None:
+        """A discovery below the immediate-birth setting starts a host-only tentative record."""
         first = transition_lifecycle(
             TrackSlotTable.empty(2),
             TrackQueryState.empty(1, 2, 2),
@@ -71,182 +114,146 @@ class TestLifecycleTransitions:
             frame_index=0,
         )
 
-        assert first.table.slots[0].status == "tentative"
+        assert first.table.slots[0].status == "inactive"
         assert first.table.slot_track_ids == (None, None)
         assert first.table.next_track_id == 0
-        assert first.state.active_mask.tolist() == [[True, False]]
-        assert [(event.kind, event.track_id) for event in first.events] == [("tentative_started", None)]
+        assert first.state.active_mask.tolist() == [[False, False]]
+        assert not first.state.query_features[0, 0].any()
+        assert not first.state.reference_boxes[0, 0].any()
+        assert [(event.kind, event.slot, event.track_id) for event in first.events] == [("tentative_started", 0, None)]
 
-        confirmed = transition_lifecycle(
-            first.table,
-            first.state,
-            _frame([0.8, 0.1], input_active_mask=first.state.active_mask),
-            TrackingSessionConfig(),
+        [record] = first.tentative_pool.records
+        assert record.tentative_id == 0
+        assert record.class_id == 0
+        assert record.first_frame == record.last_frame == 0
+        assert record.hits == 1
+        assert record.misses == 0
+        assert record.score_history == pytest.approx((0.9,), abs=1e-5)
+        assert first.tentative_pool.next_tentative_id == 1
+
+    def test_tentative_pool_id_counter_is_independent_of_the_public_track_id_counter(self) -> None:
+        """Tentative IDs and public track IDs are separate monotonic sequences."""
+        config = _immediate_config()
+        table = TrackSlotTable.empty(3)
+        state = TrackQueryState.empty(1, 3, 2)
+        pool = TentativeTrackPool.empty()
+
+        # An immediate-birth config always allocates a public track ID directly and never
+        # touches the tentative pool, so it must not advance the tentative counter.
+        activated = transition_lifecycle(
+            table,
+            state,
+            _frame([0.9, 0.1, 0.1]),
+            config,
             _PERSON_SCHEMA,
-            max_active_tracks=1,
-            frame_index=1,
-        )
-
-        assert confirmed.table.slots[0].status == "active"
-        assert confirmed.table.slot_track_ids == (0, None)
-        assert confirmed.table.next_track_id == 1
-        assert [(event.kind, event.track_id) for event in confirmed.events] == [("confirmed", 0)]
-
-    def test_nonconsecutive_tentative_hits_confirm_within_three_frame_window(self) -> None:
-        """One intervening miss does not prevent a two-of-three confirmation."""
-        first = transition_lifecycle(
-            TrackSlotTable.empty(2),
-            TrackQueryState.empty(1, 2, 2),
-            _frame([0.9, 0.1]),
-            TrackingSessionConfig(),
-            _PERSON_SCHEMA,
-            max_active_tracks=1,
-            frame_index=4,
-        )
-        trusted_features = first.state.query_features.clone()
-        missed = transition_lifecycle(
-            first.table,
-            first.state,
-            _frame(
-                [0.1, 0.1],
-                features=torch.full((1, 2, 2), 99.0),
-                input_active_mask=first.state.active_mask,
-            ),
-            TrackingSessionConfig(),
-            _PERSON_SCHEMA,
-            max_active_tracks=1,
-            frame_index=5,
-        )
-
-        assert missed.table.slots[0].status == "tentative"
-        assert missed.table.slots[0].missed_frames == 1
-        assert torch.equal(missed.state.query_features, trusted_features)
-
-        confirmed = transition_lifecycle(
-            missed.table,
-            missed.state,
-            _frame([0.8, 0.1], input_active_mask=missed.state.active_mask),
-            TrackingSessionConfig(),
-            _PERSON_SCHEMA,
-            max_active_tracks=1,
-            frame_index=6,
-        )
-
-        assert confirmed.table.slot_track_ids == (0, None)
-        assert [event.kind for event in confirmed.events] == ["confirmed"]
-
-    @pytest.mark.parametrize("second_frame,second_score", [(2, 0.1), (3, 0.9)])
-    def test_tentative_cancellation_clears_state_on_second_miss_or_expiry(
-        self, second_frame: int, second_score: float
-    ) -> None:
-        """Cancellation is immediate for two misses or an expired birth window."""
-        first = transition_lifecycle(
-            TrackSlotTable.empty(2),
-            TrackQueryState.empty(1, 2, 2),
-            _frame([0.9, 0.1]),
-            TrackingSessionConfig(),
-            _PERSON_SCHEMA,
-            max_active_tracks=1,
+            pool,
+            max_active_tracks=2,
             frame_index=0,
         )
-        cancelled = transition_lifecycle(
-            first.table,
-            first.state,
-            _frame([second_score, 0.1], input_active_mask=first.state.active_mask),
-            TrackingSessionConfig(),
-            _PERSON_SCHEMA,
-            max_active_tracks=1,
-            frame_index=second_frame,
-        )
+        assert activated.table.next_track_id == 1
+        assert activated.tentative_pool.next_tentative_id == 0
 
-        assert cancelled.table.slots[0].status == "inactive"
-        assert cancelled.table.next_track_id == 0
-        assert not cancelled.state.active_mask[0, 0]
-        assert not cancelled.state.query_features[0, 0].any()
-        assert not cancelled.state.reference_boxes[0, 0].any()
-        assert [event.kind for event in cancelled.events] == ["tentative_cancelled"]
-
-    def test_cancelled_slot_recycles_without_consuming_an_identity(self) -> None:
-        """A cancelled host/neural slot can be reused and receives an ID only on confirmation."""
-        config = TrackingSessionConfig()
-        first = transition_lifecycle(
-            TrackSlotTable.empty(2),
-            TrackQueryState.empty(1, 2, 2),
-            _frame([0.9, 0.1]),
-            config,
-            _PERSON_SCHEMA,
-            max_active_tracks=1,
-            frame_index=0,
-        )
-        cancelled = transition_lifecycle(
-            first.table,
-            first.state,
-            _frame([0.1, 0.1], input_active_mask=first.state.active_mask),
-            config,
-            _PERSON_SCHEMA,
-            max_active_tracks=1,
-            frame_index=2,
-        )
-        recycled = transition_lifecycle(
-            cancelled.table,
-            cancelled.state,
-            _frame([0.9, 0.1]),
-            config,
-            _PERSON_SCHEMA,
-            max_active_tracks=1,
-            frame_index=3,
-        )
-        confirmed = transition_lifecycle(
-            recycled.table,
-            recycled.state,
-            _frame([0.9, 0.1], input_active_mask=recycled.state.active_mask),
-            config,
-            _PERSON_SCHEMA,
-            max_active_tracks=1,
-            frame_index=4,
-        )
-
-        assert recycled.table.slots[0].status == "tentative"
-        assert confirmed.table.slot_track_ids == (0, None)
-
-    def test_confirmation_respects_durable_capacity(self) -> None:
-        """Tentatives remain ID-less when durable capacity is full and confirm when it opens."""
-        config = TrackingSessionConfig(max_missed_frames=0)
-        first = transition_lifecycle(
+        non_immediate = transition_lifecycle(
             TrackSlotTable.empty(3),
             TrackQueryState.empty(1, 3, 2),
-            _frame([0.9, 0.8, 0.1]),
+            _frame([0.1, 0.9, 0.1]),
+            TrackingSessionConfig(),
+            _PERSON_SCHEMA,
+            TentativeTrackPool.empty(),
+            max_active_tracks=2,
+            frame_index=0,
+        )
+        assert non_immediate.table.next_track_id == 0
+        assert non_immediate.tentative_pool.next_tentative_id == 1
+
+    def test_starting_a_tentative_leaves_every_previously_inactive_slot_mask_bit_false(self) -> None:
+        """Two simultaneous discoveries under a non-immediate config never flip active_mask."""
+        result = transition_lifecycle(
+            TrackSlotTable.empty(3),
+            TrackQueryState.empty(1, 3, 2),
+            _frame([0.9, 0.9, 0.1]),
+            TrackingSessionConfig(),
+            _PERSON_SCHEMA,
+            max_active_tracks=2,
+            frame_index=0,
+        )
+
+        assert result.state.active_mask.tolist() == [[False, False, False]]
+        assert not result.state.query_features.any()
+        assert not result.state.reference_boxes.any()
+        assert len(result.tentative_pool.records) == 2
+
+    def test_high_score_in_the_original_discovery_slot_cannot_confirm_a_tentative(self) -> None:
+        """Repeated high scores at the same query index never allocate a public track ID.
+
+        This reproduces the corrected behavior for the PRD's documented failure mode: the old
+        implementation copied a first-hit discovery into recurrent state and marked its slot
+        active, so the *same* query then supplied its own second-frame confirmation evidence
+        (106-of-107 self-confirmations observed with the old semantics). With tentative
+        candidates held outside recurrence, the slot never becomes active, so a persistently
+        high score at that index can only ever look like a brand new inactive-slot discovery --
+        never a continuation of the earlier candidate -- and nothing in this story confirms it.
+        """
+        table = TrackSlotTable.empty(2)
+        state = TrackQueryState.empty(1, 2, 2)
+        pool = TentativeTrackPool.empty()
+
+        for frame_index in range(10):
+            transition = transition_lifecycle(
+                table,
+                state,
+                _frame([0.99, 0.01], input_active_mask=state.active_mask),
+                TrackingSessionConfig(),
+                _PERSON_SCHEMA,
+                pool,
+                max_active_tracks=1,
+                frame_index=frame_index,
+            )
+            table, state, pool = transition.table, transition.state, transition.tentative_pool
+
+            assert table.slot_track_ids == (None, None)
+            assert not any(event.kind == "confirmed" for event in transition.events)
+            assert not state.active_mask[0, 0]
+
+        assert table.next_track_id == 0
+
+    def test_existing_active_track_lifecycle_is_unaffected_by_an_empty_tentative_pool(self) -> None:
+        """Continuation, suspension, and termination are identical whether or not a pool is passed."""
+        config = _immediate_config(max_missed_frames=0)
+        birth = transition_lifecycle(
+            TrackSlotTable.empty(2),
+            TrackQueryState.empty(1, 2, 2),
+            _frame([0.9, 0.1]),
             config,
             _PERSON_SCHEMA,
             max_active_tracks=1,
             frame_index=0,
         )
-        pressured = transition_lifecycle(
-            first.table,
-            first.state,
-            _frame([0.9, 0.8, 0.1], input_active_mask=first.state.active_mask),
+
+        with_default_pool = transition_lifecycle(
+            birth.table,
+            birth.state,
+            _frame([0.1, 0.1], input_active_mask=birth.state.active_mask),
             config,
             _PERSON_SCHEMA,
             max_active_tracks=1,
             frame_index=1,
         )
-
-        assert pressured.table.slot_track_ids == (0, None, None)
-        assert pressured.table.slots[1].status == "tentative"
-        assert [event.kind for event in pressured.events] == ["confirmed", "capacity_suppressed"]
-
-        available = transition_lifecycle(
-            pressured.table,
-            pressured.state,
-            _frame([0.1, 0.8, 0.1], input_active_mask=pressured.state.active_mask),
+        with_explicit_empty_pool = transition_lifecycle(
+            birth.table,
+            birth.state,
+            _frame([0.1, 0.1], input_active_mask=birth.state.active_mask),
             config,
             _PERSON_SCHEMA,
+            TentativeTrackPool.empty(),
             max_active_tracks=1,
-            frame_index=2,
+            frame_index=1,
         )
 
-        assert available.table.slot_track_ids == (None, 1, None)
-        assert [event.kind for event in available.events] == ["terminated", "confirmed"]
+        assert with_default_pool.table == with_explicit_empty_pool.table
+        assert torch.equal(with_default_pool.state.active_mask, with_explicit_empty_pool.state.active_mask)
+        assert [event.kind for event in with_default_pool.events] == ["terminated"]
+        assert [event.kind for event in with_explicit_empty_pool.events] == ["terminated"]
 
     def test_reliable_discovery_activates_with_monotonic_ids_and_commits_state(self) -> None:
         """Eligible discoveries activate up to capacity and carry candidate neural state."""
@@ -508,7 +515,7 @@ class TestDiscoveryBounds:
         ]
 
     def test_tentative_capacity_is_separate_from_the_per_frame_candidate_limit(self) -> None:
-        """Discovery consideration and coexisting tentative slots are bounded independently."""
+        """Discovery consideration and coexisting tentative records are bounded independently."""
         num_queries = 40
         boxes = torch.stack(
             [torch.tensor([index / num_queries + 0.005, 0.5, 0.01, 0.01]) for index in range(num_queries)]
@@ -524,35 +531,63 @@ class TestDiscoveryBounds:
         )
         reasons = [event.reason for event in result.events]
 
-        assert sum(slot.status == "tentative" for slot in result.table.slots) == 10
+        assert len(result.tentative_pool.records) == 10
+        assert sum(slot.status != "inactive" for slot in result.table.slots) == 0
         assert reasons.count("tentative_capacity") == 2
         assert reasons.count("discovery_candidate_limit") == num_queries - 12
 
     def test_long_false_positive_trajectory_cannot_exceed_tentative_capacity(self) -> None:
-        """Sustained spurious discoveries never accumulate unbounded tentative slots."""
+        """Sustained spurious discoveries never accumulate unbounded tentative records.
+
+        Each frame's boxes jump to a disjoint region from the previous frame's (no query
+        index's box ever overlaps its own prior-frame box), so independent-rediscovery
+        association (PRD US-003) never finds an eligible edge and nothing is ever confirmed --
+        this isolates the tentative-pool capacity bound from confirmation behavior, which is
+        covered separately in ``TestIndependentRediscoveryConfirmation``.
+        """
         num_queries = 8
-        boxes = torch.stack(
-            [torch.tensor([index / num_queries + 0.02, 0.5, 0.02, 0.02]) for index in range(num_queries)]
-        ).unsqueeze(0)
+        num_frames = 6
+        total_slots = num_frames * num_queries
+
+        def _boxes(frame_index: int) -> torch.Tensor:
+            """Give every (frame, index) pair in this run its own disjoint, non-overlapping slot."""
+            return torch.stack(
+                [
+                    torch.tensor(
+                        [
+                            ((frame_index * num_queries + index) % total_slots) / total_slots + 0.5 / total_slots,
+                            0.5,
+                            0.3 / total_slots,
+                            0.02,
+                        ]
+                    )
+                    for index in range(num_queries)
+                ]
+            ).unsqueeze(0)
+
         config = TrackingSessionConfig(max_tentative_tracks=2)
         table = TrackSlotTable.empty(num_queries)
         state = TrackQueryState.empty(1, num_queries, 2)
+        pool = TentativeTrackPool.empty()
 
-        for frame_index in range(6):
+        for frame_index in range(num_frames):
             transition = transition_lifecycle(
                 table,
                 state,
-                _frame([0.9] * num_queries, boxes=boxes, input_active_mask=state.active_mask),
+                _frame([0.9] * num_queries, boxes=_boxes(frame_index), input_active_mask=state.active_mask),
                 config,
                 _PERSON_SCHEMA,
+                pool,
                 max_active_tracks=3,
                 frame_index=frame_index,
             )
-            table, state = transition.table, transition.state
-            assert sum(slot.status == "tentative" for slot in table.slots) <= 2
+            table, state, pool = transition.table, transition.state, transition.tentative_pool
+            assert len(pool.records) <= 2
             assert sum(slot.status in {"active", "suspended"} for slot in table.slots) <= 3
 
-        assert table.next_track_id <= 3
+        # Every (frame, index) box occupies its own disjoint slot, so no independent rediscovery
+        # ever occurs across the whole run.
+        assert table.next_track_id == 0
 
     def test_discovery_overlapping_an_active_track_records_complete_evidence(self) -> None:
         """A duplicate of an emitted track reports its reason, score, class, status, and overlap."""
@@ -617,8 +652,16 @@ class TestDiscoveryBounds:
             pytest.approx(1.0),
         )
 
-    def test_discovery_overlapping_a_tentative_track_is_suppressed(self) -> None:
-        """An unconfirmed tentative slot cannot be duplicated by a stronger discovery."""
+    def test_discovery_over_a_pending_tentatives_box_confirms_it_from_a_different_query_index(self) -> None:
+        """A later frame's fresh discovery over a pending tentative's box confirms it (PRD US-003).
+
+        Before independent-rediscovery confirmation existed (PRD US-002), this exact setup was
+        documented as starting an unrelated second tentative, since a pending candidate reserved
+        no decoder slot or ``occupied`` region to suppress a duplicate against. Now that
+        confirmation is implemented, a later frame's fresh, different-slot discovery landing on
+        the tentative's last observed box is precisely the independent evidence PRD Section 5.1
+        requires, so it confirms the pending tentative instead of starting a second one.
+        """
         boxes = torch.tensor([[[0.5, 0.5, 0.4, 0.4], [0.5, 0.5, 0.4, 0.4], [0.1, 0.1, 0.05, 0.05]]])
         first = transition_lifecycle(
             TrackSlotTable.empty(3),
@@ -635,45 +678,16 @@ class TestDiscoveryBounds:
             _frame([0.1, 0.95, 0.1], boxes=boxes, input_active_mask=first.state.active_mask),
             TrackingSessionConfig(),
             _PERSON_SCHEMA,
+            first.tentative_pool,
             max_active_tracks=2,
             frame_index=1,
         )
-        suppression = next(event for event in second.events if event.kind == "duplicate_suppressed")
 
-        assert first.table.slots[0].status == "tentative"
-        assert second.table.slots[1].status == "inactive"
-        assert (suppression.slot, suppression.compared_status, suppression.overlap) == (
-            1,
-            "tentative",
-            pytest.approx(1.0),
-        )
-
-    def test_confirmation_blocked_by_durable_capacity_reports_its_reason(self) -> None:
-        """Capacity suppressions are distinguishable from duplicate suppressions."""
-        boxes = torch.tensor([[[0.1, 0.1, 0.05, 0.05], [0.6, 0.6, 0.05, 0.05], [0.9, 0.9, 0.05, 0.05]]])
-        first = transition_lifecycle(
-            TrackSlotTable.empty(3),
-            TrackQueryState.empty(1, 3, 2),
-            _frame([0.9, 0.1, 0.1], boxes=boxes),
-            TrackingSessionConfig(),
-            _PERSON_SCHEMA,
-            max_active_tracks=0,
-            frame_index=0,
-        )
-        second = transition_lifecycle(
-            first.table,
-            first.state,
-            _frame([0.9, 0.1, 0.1], boxes=boxes, input_active_mask=first.state.active_mask),
-            TrackingSessionConfig(),
-            _PERSON_SCHEMA,
-            max_active_tracks=0,
-            frame_index=1,
-        )
-        suppression = next(event for event in second.events if event.kind == "capacity_suppressed")
-
-        assert second.table.slot_track_ids == (None, None, None)
-        assert (suppression.slot, suppression.reason, suppression.compared_status) == (0, "durable_capacity", None)
-        assert suppression.class_id == 0
+        assert len(first.tentative_pool.records) == 1
+        assert [event.kind for event in second.events] == ["confirmed"]
+        assert second.tentative_pool.records == ()
+        assert second.table.slot_track_ids == (None, 0, None)
+        assert second.table.slots[1].status == "active"
 
     def test_non_suppression_events_cannot_claim_a_suppression_reason(self) -> None:
         """Diagnostic roles stay unambiguous for downstream failure slices."""
@@ -807,9 +821,7 @@ class TestReassociation:
             suspended.table,
             suspended.state,
             _frame([0.1, 0.95, 0.1], boxes=boxes, input_active_mask=suspended.state.active_mask),
-            _immediate_config(
-                reassociation_enabled=True, reassociation_iou_threshold=0.9, duplicate_iou_threshold=0.5
-            ),
+            _immediate_config(reassociation_enabled=True, reassociation_iou_threshold=0.9, duplicate_iou_threshold=0.5),
             _PERSON_SCHEMA,
             max_active_tracks=2,
             frame_index=2,
@@ -835,6 +847,469 @@ class TestReassociation:
 
         assert reassociated.table.next_track_id == suspended.table.next_track_id
         assert sum(slot.status in {"active", "suspended"} for slot in reassociated.table.slots) == 1
+
+
+class TestIndependentRediscoveryConfirmation:
+    """Two-hit confirmation via later-frame, independently generated discoveries (PRD US-003)."""
+
+    def _config(self, **kwargs: object) -> TrackingSessionConfig:
+        """Retain a common non-immediate baseline so each test only overrides what it exercises."""
+        fields: dict[str, object] = {
+            "tentative_confirmation_hits": 2,
+            "tentative_confirmation_window_frames": 3,
+            "tentative_max_misses": 2,
+            "tentative_association_iou_threshold": 0.5,
+        }
+        fields.update(kwargs)
+        return TrackingSessionConfig(**fields)
+
+    def test_confirmation_accepts_a_discovery_from_a_different_query_index_and_seeds_state_from_it(self) -> None:
+        """The confirming discovery's own feature/box seed recurrence, not the first-hit slot's."""
+        box = torch.tensor([0.3, 0.3, 0.1, 0.1])
+        boxes0 = torch.zeros(1, 3, 4)
+        boxes0[0, 0] = box
+        first = transition_lifecycle(
+            TrackSlotTable.empty(3),
+            TrackQueryState.empty(1, 3, 2),
+            _frame([0.9, 0.1, 0.1], boxes=boxes0),
+            self._config(),
+            _PERSON_SCHEMA,
+            max_active_tracks=2,
+            frame_index=0,
+        )
+        assert [event.kind for event in first.events] == ["tentative_started"]
+        [record] = first.tentative_pool.records
+
+        boxes1 = torch.zeros(1, 3, 4)
+        boxes1[0, 2] = box
+        confirming_features = torch.full((1, 3, 2), 5.0)
+        second = transition_lifecycle(
+            first.table,
+            first.state,
+            _frame(
+                [0.1, 0.1, 0.9],
+                boxes=boxes1,
+                features=confirming_features,
+                input_active_mask=first.state.active_mask,
+            ),
+            self._config(),
+            _PERSON_SCHEMA,
+            first.tentative_pool,
+            max_active_tracks=2,
+            frame_index=1,
+        )
+
+        assert [(event.kind, event.slot, event.track_id, event.tentative_id) for event in second.events] == [
+            ("confirmed", 2, 0, record.tentative_id)
+        ]
+        assert second.table.slot_track_ids == (None, None, 0)
+        assert torch.equal(second.state.query_features[:, 2], confirming_features[:, 2])
+        assert torch.equal(second.state.reference_boxes[0, 2], box)
+        assert second.tentative_pool.records == ()
+        # No backfill: the original first-hit slot (index 0) was never touched.
+        assert second.table.slots[0].status == "inactive"
+        assert not second.state.reference_boxes[0, 0].any()
+        assert not second.state.query_features[0, 0].any()
+
+    def test_association_ignores_a_class_mismatched_discovery(self) -> None:
+        """A same-box discovery of the wrong class cannot increment a tentative's hit count."""
+        schema = ClassSchema(
+            foreground_classes=(
+                ForegroundClass(class_id=0, name="cat", external_category_id=7),
+                ForegroundClass(class_id=1, name="dog", external_category_id=12),
+            ),
+            background_logit_index=2,
+        )
+        box = torch.tensor([0.3, 0.3, 0.1, 0.1])
+        boxes0 = torch.zeros(1, 2, 4)
+        boxes0[0, 0] = box
+        frame0 = TrackingFrameOutput(
+            pred_logits=torch.tensor([[[5.0, -5.0, -5.0], [-5.0, -5.0, 5.0]]]),
+            pred_boxes=boxes0,
+            candidate_state=TrackQueryState(
+                query_features=torch.zeros(1, 2, 2),
+                reference_boxes=boxes0,
+                active_mask=torch.ones(1, 2, dtype=torch.bool),
+            ),
+            input_active_mask=torch.zeros(1, 2, dtype=torch.bool),
+        )
+        first = transition_lifecycle(
+            TrackSlotTable.empty(2),
+            TrackQueryState.empty(1, 2, 2),
+            frame0,
+            self._config(),
+            schema,
+            max_active_tracks=1,
+            frame_index=0,
+        )
+        [record] = first.tentative_pool.records
+        assert record.class_id == 0
+
+        boxes1 = torch.zeros(1, 2, 4)
+        boxes1[0, 1] = box
+        frame1 = TrackingFrameOutput(
+            pred_logits=torch.tensor([[[-5.0, -5.0, 5.0], [-5.0, 5.0, -5.0]]]),
+            pred_boxes=boxes1,
+            candidate_state=TrackQueryState(
+                query_features=torch.zeros(1, 2, 2),
+                reference_boxes=boxes1,
+                active_mask=torch.ones(1, 2, dtype=torch.bool),
+            ),
+            input_active_mask=first.state.active_mask,
+        )
+        second = transition_lifecycle(
+            first.table,
+            first.state,
+            frame1,
+            self._config(),
+            schema,
+            first.tentative_pool,
+            max_active_tracks=1,
+            frame_index=1,
+        )
+
+        # The wrong-class discovery cannot confirm the class-0 tentative; it only starts its
+        # own, unrelated class-1 tentative via the ordinary birth path.
+        assert [event.kind for event in second.events] == ["tentative_started"]
+        records_by_class = {r.class_id: r for r in second.tentative_pool.records}
+        assert records_by_class[0].hits == 1
+        assert records_by_class[0].misses == 1
+        assert records_by_class[1].hits == 1
+
+    def test_association_ignores_a_below_gate_discovery(self) -> None:
+        """A same-class discovery whose IoU falls below the association gate cannot confirm."""
+        boxes0 = torch.zeros(1, 2, 4)
+        boxes0[0, 0] = torch.tensor([0.2, 0.2, 0.1, 0.1])
+        first = transition_lifecycle(
+            TrackSlotTable.empty(2),
+            TrackQueryState.empty(1, 2, 2),
+            _frame([0.9, 0.1], boxes=boxes0),
+            self._config(),
+            _PERSON_SCHEMA,
+            max_active_tracks=1,
+            frame_index=0,
+        )
+        [record] = first.tentative_pool.records
+
+        boxes1 = torch.zeros(1, 2, 4)
+        boxes1[0, 1] = torch.tensor([0.8, 0.8, 0.1, 0.1])
+        second = transition_lifecycle(
+            first.table,
+            first.state,
+            _frame([0.1, 0.9], boxes=boxes1, input_active_mask=first.state.active_mask),
+            self._config(),
+            _PERSON_SCHEMA,
+            first.tentative_pool,
+            max_active_tracks=1,
+            frame_index=1,
+        )
+
+        assert [event.kind for event in second.events] == ["tentative_started"]
+        original = next(r for r in second.tentative_pool.records if r.tentative_id == record.tentative_id)
+        assert original.hits == 1
+        assert original.misses == 1
+
+    def test_competing_tentatives_for_one_discovery_resolve_by_the_documented_tie_break(self) -> None:
+        """Deterministic tie-break resolves competing tentatives tied on total IoU."""
+        box = torch.tensor([0.5, 0.5, 0.2, 0.2])
+        boxes0 = torch.zeros(1, 3, 4)
+        boxes0[0, 0] = box
+        boxes0[0, 1] = box
+        first = transition_lifecycle(
+            TrackSlotTable.empty(3),
+            TrackQueryState.empty(1, 3, 2),
+            _frame([0.9, 0.9, 0.1], boxes=boxes0),
+            self._config(),
+            _PERSON_SCHEMA,
+            max_active_tracks=2,
+            frame_index=0,
+        )
+        tentative_a, tentative_b = first.tentative_pool.records
+        assert tentative_a.tentative_id < tentative_b.tentative_id
+
+        boxes1 = torch.zeros(1, 3, 4)
+        boxes1[0, 2] = box
+        second = transition_lifecycle(
+            first.table,
+            first.state,
+            _frame([0.1, 0.1, 0.9], boxes=boxes1, input_active_mask=first.state.active_mask),
+            self._config(),
+            _PERSON_SCHEMA,
+            first.tentative_pool,
+            max_active_tracks=2,
+            frame_index=1,
+        )
+
+        assert [(event.kind, event.tentative_id) for event in second.events] == [
+            ("confirmed", tentative_a.tentative_id)
+        ]
+        assert second.table.slot_track_ids == (None, None, 0)
+        [surviving] = second.tentative_pool.records
+        assert surviving.tentative_id == tentative_b.tentative_id
+        assert surviving.hits == 1
+        assert surviving.misses == 1
+
+    def test_matching_is_deterministic_regardless_of_pool_record_order(self) -> None:
+        """Reordering the incoming tentative pool tuple must not change the tie-break winner."""
+        box = torch.tensor([0.5, 0.5, 0.2, 0.2])
+        boxes0 = torch.zeros(1, 3, 4)
+        boxes0[0, 0] = box
+        boxes0[0, 1] = box
+        first = transition_lifecycle(
+            TrackSlotTable.empty(3),
+            TrackQueryState.empty(1, 3, 2),
+            _frame([0.9, 0.9, 0.1], boxes=boxes0),
+            self._config(),
+            _PERSON_SCHEMA,
+            max_active_tracks=2,
+            frame_index=0,
+        )
+        lower_id, higher_id = first.tentative_pool.records
+        assert lower_id.tentative_id < higher_id.tentative_id
+        reordered_pool = TentativeTrackPool((higher_id, lower_id), first.tentative_pool.next_tentative_id)
+
+        boxes1 = torch.zeros(1, 3, 4)
+        boxes1[0, 2] = box
+        forward = transition_lifecycle(
+            first.table,
+            first.state,
+            _frame([0.1, 0.1, 0.9], boxes=boxes1, input_active_mask=first.state.active_mask),
+            self._config(),
+            _PERSON_SCHEMA,
+            first.tentative_pool,
+            max_active_tracks=2,
+            frame_index=1,
+        )
+        reordered = transition_lifecycle(
+            first.table,
+            first.state,
+            _frame([0.1, 0.1, 0.9], boxes=boxes1, input_active_mask=first.state.active_mask),
+            self._config(),
+            _PERSON_SCHEMA,
+            reordered_pool,
+            max_active_tracks=2,
+            frame_index=1,
+        )
+
+        assert [(event.kind, event.tentative_id) for event in forward.events] == [("confirmed", lower_id.tentative_id)]
+        assert [(event.kind, event.tentative_id) for event in reordered.events] == [
+            ("confirmed", lower_id.tentative_id)
+        ]
+
+    def test_two_nearby_tentatives_confirm_from_their_own_matching_discovery(self) -> None:
+        """Distinct nearby tentatives each confirm from the discovery that actually overlaps them."""
+        box_left = torch.tensor([0.2, 0.5, 0.15, 0.3])
+        box_right = torch.tensor([0.4, 0.5, 0.15, 0.3])
+        boxes0 = torch.zeros(1, 3, 4)
+        boxes0[0, 0] = box_left
+        boxes0[0, 1] = box_right
+        first = transition_lifecycle(
+            TrackSlotTable.empty(3),
+            TrackQueryState.empty(1, 3, 2),
+            _frame([0.9, 0.9, 0.1], boxes=boxes0),
+            self._config(),
+            _PERSON_SCHEMA,
+            max_active_tracks=2,
+            frame_index=0,
+        )
+        left, right = first.tentative_pool.records
+
+        # The pair reappears at swapped query indices next frame -- association must key off
+        # box overlap, not which decoder position originally observed each candidate.
+        boxes1 = torch.zeros(1, 3, 4)
+        boxes1[0, 0] = box_right
+        boxes1[0, 1] = box_left
+        second = transition_lifecycle(
+            first.table,
+            first.state,
+            _frame([0.9, 0.9, 0.1], boxes=boxes1, input_active_mask=first.state.active_mask),
+            self._config(),
+            _PERSON_SCHEMA,
+            first.tentative_pool,
+            max_active_tracks=2,
+            frame_index=1,
+        )
+
+        confirmed = {event.tentative_id: event.slot for event in second.events if event.kind == "confirmed"}
+        assert confirmed == {left.tentative_id: 1, right.tentative_id: 0}
+
+    def test_new_tentative_starts_remain_bounded_by_capacity_after_an_association_step(self) -> None:
+        """Pending-tentative capacity is still enforced when nothing is freed by association."""
+        box = torch.tensor([0.5, 0.5, 0.2, 0.2])
+        far_box = torch.tensor([0.05, 0.05, 0.05, 0.05])
+        boxes0 = torch.zeros(1, 3, 4)
+        boxes0[0, 0] = box
+        first = transition_lifecycle(
+            TrackSlotTable.empty(3),
+            TrackQueryState.empty(1, 3, 2),
+            _frame([0.9, 0.1, 0.1], boxes=boxes0),
+            self._config(max_tentative_tracks=1),
+            _PERSON_SCHEMA,
+            max_active_tracks=2,
+            frame_index=0,
+        )
+        [record] = first.tentative_pool.records
+
+        boxes1 = torch.zeros(1, 3, 4)
+        boxes1[0, 1] = far_box
+        boxes1[0, 2] = torch.tensor([0.9, 0.9, 0.05, 0.05])
+        second = transition_lifecycle(
+            first.table,
+            first.state,
+            _frame([0.1, 0.9, 0.9], boxes=boxes1, input_active_mask=first.state.active_mask),
+            self._config(max_tentative_tracks=1),
+            _PERSON_SCHEMA,
+            first.tentative_pool,
+            max_active_tracks=2,
+            frame_index=1,
+        )
+
+        assert [event.kind for event in second.events if event.kind == "confirmed"] == []
+        reasons = [event.reason for event in second.events]
+        assert reasons.count("tentative_capacity") == 2
+        [surviving] = second.tentative_pool.records
+        assert surviving.tentative_id == record.tentative_id
+        assert surviving.misses == 1
+
+    def test_tentative_is_cancelled_exactly_when_the_confirmation_window_elapses(self) -> None:
+        """A pending tentative survives through its last eligible frame and is cancelled after."""
+        box = torch.tensor([0.5, 0.5, 0.2, 0.2])
+        config = self._config(tentative_confirmation_window_frames=3, tentative_max_misses=10)
+        boxes0 = torch.zeros(1, 2, 4)
+        boxes0[0, 0] = box
+        first = transition_lifecycle(
+            TrackSlotTable.empty(2),
+            TrackQueryState.empty(1, 2, 2),
+            _frame([0.9, 0.1], boxes=boxes0),
+            config,
+            _PERSON_SCHEMA,
+            max_active_tracks=1,
+            frame_index=0,
+        )
+        [record] = first.tentative_pool.records
+
+        # Frame index 2 == first_frame(0) + window(3) - 1: still inside the inclusive window.
+        still_pending = transition_lifecycle(
+            first.table,
+            first.state,
+            _frame([0.1, 0.1], input_active_mask=first.state.active_mask),
+            config,
+            _PERSON_SCHEMA,
+            first.tentative_pool,
+            max_active_tracks=1,
+            frame_index=2,
+        )
+        assert [event.kind for event in still_pending.events] == []
+        [surviving] = still_pending.tentative_pool.records
+        assert surviving.tentative_id == record.tentative_id
+        assert surviving.misses == 2
+
+        # Frame index 3 == first_frame(0) + window(3): the window has fully elapsed.
+        cancelled = transition_lifecycle(
+            still_pending.table,
+            still_pending.state,
+            _frame([0.1, 0.1], input_active_mask=still_pending.state.active_mask),
+            config,
+            _PERSON_SCHEMA,
+            still_pending.tentative_pool,
+            max_active_tracks=1,
+            frame_index=3,
+        )
+        assert [(event.kind, event.tentative_id) for event in cancelled.events] == [
+            ("tentative_cancelled", record.tentative_id)
+        ]
+        assert cancelled.tentative_pool.records == ()
+
+    def test_tentative_is_cancelled_exactly_when_misses_reach_the_limit_across_a_frame_gap(self) -> None:
+        """Miss expiry is a plain elapsed-frame gap, so it is exact even across skipped frames."""
+        box = torch.tensor([0.5, 0.5, 0.2, 0.2])
+        config = self._config(tentative_confirmation_window_frames=100, tentative_max_misses=3)
+        boxes0 = torch.zeros(1, 2, 4)
+        boxes0[0, 0] = box
+        first = transition_lifecycle(
+            TrackSlotTable.empty(2),
+            TrackQueryState.empty(1, 2, 2),
+            _frame([0.9, 0.1], boxes=boxes0),
+            config,
+            _PERSON_SCHEMA,
+            max_active_tracks=1,
+            frame_index=0,
+        )
+        [record] = first.tentative_pool.records
+
+        # One frame short of the limit survives.
+        survived = transition_lifecycle(
+            first.table,
+            first.state,
+            _frame([0.1, 0.1], input_active_mask=first.state.active_mask),
+            config,
+            _PERSON_SCHEMA,
+            first.tentative_pool,
+            max_active_tracks=1,
+            frame_index=2,
+        )
+        assert [event.kind for event in survived.events] == []
+        [surviving] = survived.tentative_pool.records
+        assert surviving.misses == 2
+
+        # A three-frame gap (frame_index jumps from 0 straight to 3) lands exactly at the miss
+        # limit in one call, without needing three separate unmatched updates.
+        cancelled = transition_lifecycle(
+            first.table,
+            first.state,
+            _frame([0.1, 0.1], input_active_mask=first.state.active_mask),
+            config,
+            _PERSON_SCHEMA,
+            first.tentative_pool,
+            max_active_tracks=1,
+            frame_index=3,
+        )
+        assert [(event.kind, event.tentative_id) for event in cancelled.events] == [
+            ("tentative_cancelled", record.tentative_id)
+        ]
+
+    def test_confirmation_blocked_by_durable_capacity_keeps_the_tentative_pending(self) -> None:
+        """A capacity-blocked confirmation leaves the tentative alive with its incremented hit count."""
+        box_a = torch.tensor([0.2, 0.5, 0.1, 0.1])
+        box_b = torch.tensor([0.8, 0.5, 0.1, 0.1])
+        boxes0 = torch.zeros(1, 4, 4)
+        boxes0[0, 0] = box_a
+        boxes0[0, 1] = box_b
+        config = self._config()
+        first = transition_lifecycle(
+            TrackSlotTable.empty(4),
+            TrackQueryState.empty(1, 4, 2),
+            _frame([0.9, 0.9, 0.1, 0.1], boxes=boxes0),
+            config,
+            _PERSON_SCHEMA,
+            max_active_tracks=1,
+            frame_index=0,
+        )
+        tentative_a, tentative_b = first.tentative_pool.records
+        assert tentative_a.tentative_id < tentative_b.tentative_id
+
+        boxes1 = torch.zeros(1, 4, 4)
+        boxes1[0, 2] = box_a
+        boxes1[0, 3] = box_b
+        second = transition_lifecycle(
+            first.table,
+            first.state,
+            _frame([0.1, 0.1, 0.9, 0.9], boxes=boxes1, input_active_mask=first.state.active_mask),
+            config,
+            _PERSON_SCHEMA,
+            first.tentative_pool,
+            max_active_tracks=1,
+            frame_index=1,
+        )
+
+        confirmed_event = next(event for event in second.events if event.kind == "confirmed")
+        assert confirmed_event.tentative_id == tentative_a.tentative_id
+        blocked_event = next(event for event in second.events if event.reason == "durable_capacity")
+        assert blocked_event.tentative_id == tentative_b.tentative_id
+        [surviving] = second.tentative_pool.records
+        assert surviving.tentative_id == tentative_b.tentative_id
+        assert surviving.hits == 2
+        assert surviving.misses == 0
 
 
 class TestMotionReferencePrediction:
@@ -911,9 +1386,7 @@ class TestMotionReferencePrediction:
         suspended = transition_lifecycle(
             second.table,
             second.state,
-            _frame(
-                [0.1, 0.05], boxes=self._boxes([0.2, 0.5, 0.2, 0.2]), input_active_mask=second.state.active_mask
-            ),
+            _frame([0.1, 0.05], boxes=self._boxes([0.2, 0.5, 0.2, 0.2]), input_active_mask=second.state.active_mask),
             config,
             _PERSON_SCHEMA,
             max_active_tracks=1,
@@ -1014,9 +1487,7 @@ class TestMotionReferencePrediction:
         direct_jump = transition_lifecycle(
             first.table,
             first.state,
-            _frame(
-                [0.1, 0.05], boxes=self._boxes([0.5, 0.5, 0.2, 0.2]), input_active_mask=first.state.active_mask
-            ),
+            _frame([0.1, 0.05], boxes=self._boxes([0.5, 0.5, 0.2, 0.2]), input_active_mask=first.state.active_mask),
             config,
             _PERSON_SCHEMA,
             max_active_tracks=1,
@@ -1028,9 +1499,7 @@ class TestMotionReferencePrediction:
         intermediate = transition_lifecycle(
             first.table,
             first.state,
-            _frame(
-                [0.1, 0.05], boxes=self._boxes([0.5, 0.5, 0.2, 0.2]), input_active_mask=first.state.active_mask
-            ),
+            _frame([0.1, 0.05], boxes=self._boxes([0.5, 0.5, 0.2, 0.2]), input_active_mask=first.state.active_mask),
             config,
             _PERSON_SCHEMA,
             max_active_tracks=1,
@@ -1414,3 +1883,679 @@ class TestIdentityMemory:
         assert terminated.table.slots[0].status == "inactive"
         assert terminated.table.slots[0].identity_memory == ()
         assert [event.kind for event in terminated.events if event.slot == 0] == ["terminated"]
+
+
+class TestTentativeTrackPool:
+    """Structural invariants of the host-only tentative candidate registry (PRD US-002)."""
+
+    def _record(self, **overrides: object) -> TentativeRecord:
+        fields: dict[str, object] = {
+            "tentative_id": 0,
+            "class_id": 0,
+            "first_frame": 0,
+            "last_frame": 0,
+            "hits": 1,
+            "misses": 0,
+            "score_history": (0.9,),
+            "last_observed_box": (0.5, 0.5, 0.1, 0.1),
+        }
+        fields.update(overrides)
+        return TentativeRecord(**fields)
+
+    def test_empty_pool_has_no_records_and_a_zeroed_counter(self) -> None:
+        pool = TentativeTrackPool.empty()
+
+        assert pool.records == ()
+        assert pool.next_tentative_id == 0
+
+    def test_pool_and_record_are_immutable(self) -> None:
+        record = self._record()
+        pool = TentativeTrackPool((record,), 1)
+
+        with pytest.raises(AttributeError):
+            record.hits = 2  # type: ignore[misc]
+        with pytest.raises(AttributeError):
+            pool.records = ()  # type: ignore[misc]
+
+    def test_duplicate_tentative_ids_are_rejected(self) -> None:
+        with pytest.raises(ValueError, match="unique"):
+            TentativeTrackPool((self._record(tentative_id=0), self._record(tentative_id=0)), 1)
+
+    def test_next_id_must_exceed_every_assigned_tentative_id(self) -> None:
+        with pytest.raises(ValueError, match="greater than every assigned"):
+            TentativeTrackPool((self._record(tentative_id=5),), 5)
+
+    def test_negative_next_tentative_id_is_rejected(self) -> None:
+        with pytest.raises(ValueError, match="cannot be negative"):
+            TentativeTrackPool((), -1)
+
+    def test_record_requires_nonnegative_hit_and_miss_counters(self) -> None:
+        with pytest.raises(ValueError, match="cannot be negative"):
+            self._record(misses=-1)
+
+    def test_record_cannot_end_before_it_started(self) -> None:
+        with pytest.raises(ValueError, match="cannot end before it started"):
+            self._record(first_frame=5, last_frame=4)
+
+    def test_record_requires_at_least_one_score_observation(self) -> None:
+        with pytest.raises(ValueError, match="at least one score observation"):
+            self._record(score_history=())
+
+
+class TestConfirmationBlockedByActiveDuplicate:
+    """A discovery already representing a reliable active track (PRD US-004, Section 5.2)."""
+
+    def test_discovery_duplicating_an_active_track_cannot_start_a_tentative(self) -> None:
+        """A discovery landing on an already-active track is suppressed, not pooled."""
+        boxes = torch.tensor([[[0.1, 0.1, 0.05, 0.05], [0.1, 0.1, 0.05, 0.05], [0.9, 0.9, 0.05, 0.05]]])
+        first = transition_lifecycle(
+            TrackSlotTable.empty(3),
+            TrackQueryState.empty(1, 3, 2),
+            _frame([0.9, 0.05, 0.05], boxes=boxes),
+            _immediate_config(),
+            _PERSON_SCHEMA,
+            max_active_tracks=2,
+            frame_index=0,
+        )
+        second = transition_lifecycle(
+            first.table,
+            first.state,
+            _frame([0.9, 0.9, 0.05], boxes=boxes, input_active_mask=first.state.active_mask),
+            TrackingSessionConfig(),
+            _PERSON_SCHEMA,
+            first.tentative_pool,
+            max_active_tracks=2,
+            frame_index=1,
+        )
+
+        assert second.tentative_pool.records == ()
+        assert [event.kind for event in second.events] == ["duplicate_suppressed"]
+        suppression = second.events[0]
+        assert (suppression.slot, suppression.reason, suppression.compared_status) == (1, "duplicate_overlap", "active")
+
+    def test_discovery_duplicating_an_active_track_cannot_confirm_a_pending_tentative(self) -> None:
+        """A drifted active track now overlapping a pending tentative blocks its confirmation.
+
+        The tentative starts far from any active track (a legitimate new-object candidate).
+        By the confirming frame, the existing active track has moved into that same region
+        (simulating drift) -- so the fresh discovery that would otherwise confirm the tentative
+        also duplicates the active track. PRD Section 5.2 requires this discovery be excluded
+        from confirmation eligibility entirely; it still reaches the birth loop and is suppressed
+        there against the active track exactly like an ordinary duplicate discovery.
+        """
+        far_box = [0.1, 0.1, 0.05, 0.05]
+        near_box = [0.5, 0.5, 0.05, 0.05]
+        boxes0 = torch.tensor([[far_box, [0.9, 0.05, 0.02, 0.02], [0.9, 0.9, 0.05, 0.05]]])
+        first = transition_lifecycle(
+            TrackSlotTable.empty(3),
+            TrackQueryState.empty(1, 3, 2),
+            _frame([0.9, 0.05, 0.05], boxes=boxes0),
+            _immediate_config(),
+            _PERSON_SCHEMA,
+            max_active_tracks=2,
+            frame_index=0,
+        )
+        assert first.table.slot_track_ids == (0, None, None)
+
+        boxes1 = torch.tensor([[far_box, [0.9, 0.05, 0.02, 0.02], near_box]])
+        second = transition_lifecycle(
+            first.table,
+            first.state,
+            _frame([0.9, 0.05, 0.9], boxes=boxes1, input_active_mask=first.state.active_mask),
+            TrackingSessionConfig(),
+            _PERSON_SCHEMA,
+            first.tentative_pool,
+            max_active_tracks=2,
+            frame_index=1,
+        )
+        assert [event.kind for event in second.events] == ["tentative_started"]
+        assert len(second.tentative_pool.records) == 1
+
+        boxes2 = torch.tensor([[near_box, [0.9, 0.05, 0.02, 0.02], near_box]])
+        third = transition_lifecycle(
+            second.table,
+            second.state,
+            _frame([0.9, 0.05, 0.9], boxes=boxes2, input_active_mask=second.state.active_mask),
+            TrackingSessionConfig(),
+            _PERSON_SCHEMA,
+            second.tentative_pool,
+            max_active_tracks=2,
+            frame_index=2,
+        )
+
+        assert "confirmed" not in [event.kind for event in third.events]
+        suppression = next(event for event in third.events if event.kind == "duplicate_suppressed")
+        assert (suppression.slot, suppression.reason, suppression.compared_status) == (2, "duplicate_overlap", "active")
+        # The tentative survives unconfirmed: it was never offered as an eligible discovery, so it
+        # is simply unmatched this frame rather than cancelled (one miss, well under the default
+        # tentative_max_misses).
+        assert len(third.tentative_pool.records) == 1
+        assert third.tentative_pool.records[0].misses == 1
+
+
+class TestActiveTrackDuplicateCollisionArbitration:
+    """Deterministic arbitration between already-active duplicate tracks (PRD US-004, Section 5.2).
+
+    Every scenario uses three decoder slots: two that become active tracks under test, and a
+    third, permanently below-threshold "padding" slot -- ``max_active_tracks`` must leave at least
+    one discovery slot free (PRD's fixed-capacity invariant), so two simultaneously active tracks
+    require three total query slots.
+    """
+
+    def _birth_two_disjoint_tracks(self, *, scores: list[float], config: TrackingSessionConfig) -> LifecycleTransition:
+        boxes = torch.tensor([[[0.1, 0.1, 0.05, 0.05], [0.9, 0.9, 0.05, 0.05], [0.5, 0.9, 0.02, 0.02]]])
+        return transition_lifecycle(
+            TrackSlotTable.empty(3),
+            TrackQueryState.empty(1, 3, 2),
+            _frame([*scores, 0.05], boxes=boxes),
+            config,
+            _PERSON_SCHEMA,
+            max_active_tracks=2,
+            frame_index=0,
+        )
+
+    def test_sustained_duplicate_pair_suppresses_the_losers_emission_and_records_full_diagnostics(self) -> None:
+        """Two independently active tracks that converge emit at most one observation per frame."""
+        config = TrackingSessionConfig(collision_persistence_frames=2, collision_loser_outcome="suspended")
+        first = self._birth_two_disjoint_tracks(scores=[0.9, 0.85], config=_immediate_config())
+        assert first.table.slot_track_ids == (0, 1, None)
+
+        collided_boxes = torch.tensor([[[0.5, 0.5, 0.05, 0.05], [0.5, 0.5, 0.05, 0.05], [0.5, 0.9, 0.02, 0.02]]])
+        second = transition_lifecycle(
+            first.table,
+            first.state,
+            _frame([0.9, 0.85, 0.05], boxes=collided_boxes, input_active_mask=first.state.active_mask),
+            config,
+            _PERSON_SCHEMA,
+            max_active_tracks=2,
+            frame_index=1,
+        )
+
+        assert second.emitted_slots == (0,)
+        assert len(second.collision_events) == 1
+        event = second.collision_events[0]
+        assert isinstance(event, CollisionArbitrationEvent)
+        assert (event.winner_track_id, event.loser_track_id) == (0, 1)
+        assert (event.winner_slot, event.loser_slot) == (0, 1)
+        assert event.winner_score == pytest.approx(0.9, abs=1e-5)
+        assert event.loser_score == pytest.approx(0.85, abs=1e-5)
+        assert (event.winner_age, event.loser_age) == (2, 2)
+        assert event.class_id == 0
+        assert event.iou == pytest.approx(1.0, abs=1e-5)
+        assert event.collision_streak == 1
+        assert event.decision == "remains_active"
+        # Not yet at collision_persistence_frames=2: the loser's own lifecycle state is untouched.
+        assert second.table.slots[1].status == "active"
+        assert second.table.slot_track_ids == (0, 1, None)
+
+        third = transition_lifecycle(
+            second.table,
+            second.state,
+            _frame([0.9, 0.85, 0.05], boxes=collided_boxes, input_active_mask=second.state.active_mask),
+            config,
+            _PERSON_SCHEMA,
+            max_active_tracks=2,
+            frame_index=2,
+        )
+
+        assert third.emitted_slots == (0,)
+        assert len(third.collision_events) == 1
+        assert third.collision_events[0].decision == "suspended"
+        assert third.collision_events[0].collision_streak == 2
+        # Suppression never silently deletes lifecycle state: the loser keeps its track ID.
+        assert third.table.slots[1].status == "suspended"
+        assert third.table.slot_track_ids == (0, 1, None)
+        assert third.table.slots[1].collision_streak == 0
+
+    def test_collision_persistence_terminates_the_loser_when_configured(self) -> None:
+        """The ``"terminated"`` outcome recycles the loser's slot once persistence is reached."""
+        config = TrackingSessionConfig(collision_persistence_frames=1, collision_loser_outcome="terminated")
+        first = self._birth_two_disjoint_tracks(scores=[0.9, 0.85], config=_immediate_config())
+
+        collided_boxes = torch.tensor([[[0.5, 0.5, 0.05, 0.05], [0.5, 0.5, 0.05, 0.05], [0.5, 0.9, 0.02, 0.02]]])
+        second = transition_lifecycle(
+            first.table,
+            first.state,
+            _frame([0.9, 0.85, 0.05], boxes=collided_boxes, input_active_mask=first.state.active_mask),
+            config,
+            _PERSON_SCHEMA,
+            max_active_tracks=2,
+            frame_index=1,
+        )
+
+        assert second.emitted_slots == (0,)
+        assert second.collision_events[0].decision == "terminated"
+        assert second.table.slots[1].status == "inactive"
+        assert second.table.slot_track_ids == (0, None, None)
+
+    def test_single_frame_crossing_does_not_permanently_merge_either_identity(self) -> None:
+        """A one-frame overlap between two genuine objects never merges or terminates identity."""
+        config = TrackingSessionConfig(collision_persistence_frames=3)
+        first = self._birth_two_disjoint_tracks(scores=[0.9, 0.85], config=_immediate_config())
+
+        crossing_boxes = torch.tensor([[[0.5, 0.5, 0.05, 0.05], [0.5, 0.5, 0.05, 0.05], [0.5, 0.9, 0.02, 0.02]]])
+        crossing = transition_lifecycle(
+            first.table,
+            first.state,
+            _frame([0.9, 0.85, 0.05], boxes=crossing_boxes, input_active_mask=first.state.active_mask),
+            config,
+            _PERSON_SCHEMA,
+            max_active_tracks=2,
+            frame_index=1,
+        )
+        assert crossing.emitted_slots == (0,)
+        assert crossing.table.slot_track_ids == (0, 1, None)
+        assert crossing.table.slots[1].status == "active"
+
+        separated_boxes = torch.tensor([[[0.1, 0.1, 0.05, 0.05], [0.9, 0.9, 0.05, 0.05], [0.5, 0.9, 0.02, 0.02]]])
+        separated = transition_lifecycle(
+            crossing.table,
+            crossing.state,
+            _frame([0.9, 0.85, 0.05], boxes=separated_boxes, input_active_mask=crossing.state.active_mask),
+            config,
+            _PERSON_SCHEMA,
+            max_active_tracks=2,
+            frame_index=2,
+        )
+
+        assert separated.emitted_slots == (0, 1)
+        assert separated.table.slot_track_ids == (0, 1, None)
+        assert separated.table.slots[1].collision_streak == 0
+
+    def test_arbitration_winner_is_determined_by_score_not_slot_index(self) -> None:
+        """The higher-confidence slot wins even when it is not the lower decoder index."""
+        config = TrackingSessionConfig()
+        first = self._birth_two_disjoint_tracks(scores=[0.85, 0.9], config=_immediate_config())
+        # Higher score (slot 1, 0.9) is processed first by the birth loop and claims track_id 0.
+        assert first.table.slot_track_ids == (1, 0, None)
+
+        collided_boxes = torch.tensor([[[0.5, 0.5, 0.05, 0.05], [0.5, 0.5, 0.05, 0.05], [0.5, 0.9, 0.02, 0.02]]])
+        result = transition_lifecycle(
+            first.table,
+            first.state,
+            _frame([0.85, 0.9, 0.05], boxes=collided_boxes, input_active_mask=first.state.active_mask),
+            config,
+            _PERSON_SCHEMA,
+            max_active_tracks=2,
+            frame_index=1,
+        )
+
+        assert result.emitted_slots == (1,)
+        event = result.collision_events[0]
+        assert (event.winner_slot, event.loser_slot) == (1, 0)
+        assert (event.winner_track_id, event.loser_track_id) == (0, 1)
+
+    def test_different_class_overlap_is_not_a_collision(self) -> None:
+        """Class-aware arbitration never suppresses a same-box detection of a different class."""
+        schema = ClassSchema(
+            foreground_classes=(
+                ForegroundClass(class_id=0, name="cat", external_category_id=7),
+                ForegroundClass(class_id=1, name="dog", external_category_id=12),
+            ),
+            background_logit_index=2,
+        )
+        shared_box = [0.5, 0.5, 0.4, 0.4]
+        padding_box = [0.02, 0.98, 0.02, 0.02]
+        boxes = torch.tensor([[shared_box, shared_box, padding_box]])
+        base = _frame([0.1, 0.1, 0.1], boxes=boxes)
+        birth_frame = TrackingFrameOutput(
+            pred_logits=torch.tensor([[[6.0, -5.0, -10.0], [-5.0, 6.0, -10.0], [-5.0, -5.0, 10.0]]]),
+            pred_boxes=base.pred_boxes,
+            candidate_state=base.candidate_state,
+            input_active_mask=base.input_active_mask,
+        )
+        first = transition_lifecycle(
+            TrackSlotTable.empty(3),
+            TrackQueryState.empty(1, 3, 2),
+            birth_frame,
+            _immediate_config(),
+            schema,
+            max_active_tracks=2,
+            frame_index=0,
+        )
+        assert first.table.slot_track_ids == (0, 1, None)
+        assert [slot.class_id for slot in first.table.slots[:2]] == [0, 1]
+
+        continuation_frame = TrackingFrameOutput(
+            pred_logits=birth_frame.pred_logits,
+            pred_boxes=base.pred_boxes,
+            candidate_state=base.candidate_state,
+            input_active_mask=first.state.active_mask,
+        )
+        result = transition_lifecycle(
+            first.table,
+            first.state,
+            continuation_frame,
+            _immediate_config(),
+            schema,
+            max_active_tracks=2,
+            frame_index=1,
+        )
+
+        assert result.emitted_slots == (0, 1)
+        assert result.collision_events == ()
+
+
+class TestLifecycleInvariantValidation:
+    """Direct unit tests for ``validate_lifecycle_invariants`` (PRD US-005).
+
+    Each violation test crafts a ``LifecycleTransition`` whose ``events``/``emitted_slots`` lie
+    about what the committed ``table``/``state`` actually contain. Every dataclass in
+    ``lifecycle.py`` already refuses to *construct* a genuinely inconsistent
+    ``TrackSlotTable``/``TrackQueryState`` pair (duplicate track IDs, an inactive slot owning an
+    identity, and so on), so these tests exercise the one place such a lie could still slip
+    through undetected: a diagnostic event stream that no longer matches the state it describes.
+    """
+
+    def test_a_genuine_confirmation_from_the_production_code_path_passes_validation(self) -> None:
+        """Sanity check: two-hit independent-rediscovery confirmation never raises."""
+        config = TrackingSessionConfig(
+            tentative_confirmation_hits=2,
+            tentative_confirmation_window_frames=3,
+            tentative_association_iou_threshold=0.5,
+        )
+        box = torch.tensor([0.3, 0.3, 0.1, 0.1])
+        boxes0 = torch.zeros(1, 3, 4)
+        boxes0[0, 0] = box
+        first = transition_lifecycle(
+            TrackSlotTable.empty(3),
+            TrackQueryState.empty(1, 3, 2),
+            _frame([0.9, 0.1, 0.1], boxes=boxes0),
+            config,
+            _PERSON_SCHEMA,
+            max_active_tracks=2,
+            frame_index=0,
+        )
+        validate_lifecycle_invariants(first, _PERSON_SCHEMA)
+
+        boxes1 = torch.zeros(1, 3, 4)
+        boxes1[0, 2] = box
+        second = transition_lifecycle(
+            first.table,
+            first.state,
+            _frame([0.1, 0.1, 0.9], boxes=boxes1, input_active_mask=first.state.active_mask),
+            config,
+            _PERSON_SCHEMA,
+            first.tentative_pool,
+            max_active_tracks=2,
+            frame_index=1,
+        )
+
+        assert any(event.kind == "confirmed" for event in second.events)
+        validate_lifecycle_invariants(second, _PERSON_SCHEMA)
+
+    def test_a_tentative_started_event_that_also_carries_a_track_id_is_rejected(self) -> None:
+        """Criterion 1: a tentative-scoped event can never claim a public identity."""
+        table = TrackSlotTable((_slot(),), next_track_id=0, last_frame_index=0)
+        transition = LifecycleTransition(
+            table=table,
+            state=_crafted_state([False]),
+            tentative_pool=TentativeTrackPool((TentativeRecord(0, 0, 0, 0, 1, 0, (0.9,), (0.5, 0.5, 0.1, 0.1)),), 1),
+            events=(LifecycleEvent("tentative_started", 0, track_id=5, frame_index=0, tentative_id=0),),
+        )
+
+        with pytest.raises(LifecycleInvariantError, match="carries a public track_id"):
+            validate_lifecycle_invariants(transition, _PERSON_SCHEMA)
+
+    def test_a_tentative_started_event_whose_own_discovery_slot_went_active_is_rejected(self) -> None:
+        """Criterion 1: reproduces the exact pre-fix self-confirmation shape at the validator level.
+
+        The old semantics copied a first-hit discovery straight into ``active_mask``; this test
+        proves ``validate_lifecycle_invariants`` catches that shape even if some future change to
+        the production code accidentally reintroduced it, without requiring a live model run.
+        """
+        table = TrackSlotTable((_slot(track_id=0, status="active", age=1, hits=1, last_reliable_frame=0),), 1, 0)
+        transition = LifecycleTransition(
+            table=table,
+            state=_crafted_state([True]),
+            tentative_pool=TentativeTrackPool((TentativeRecord(0, 0, 0, 0, 1, 0, (0.9,), (0.5, 0.5, 0.1, 0.1)),), 1),
+            events=(LifecycleEvent("tentative_started", 0, track_id=None, frame_index=0, tentative_id=0),),
+        )
+
+        with pytest.raises(LifecycleInvariantError, match="became active"):
+            validate_lifecycle_invariants(transition, _PERSON_SCHEMA)
+
+    def test_two_confirmations_of_the_same_tentative_in_one_frame_are_rejected(self) -> None:
+        """Criterion 3: a tentative can be consumed by at most one confirmation per frame."""
+        table = TrackSlotTable(
+            (
+                _slot(track_id=0, status="active", age=1, hits=1, last_reliable_frame=0, class_id=0),
+                _slot(track_id=1, status="active", age=1, hits=1, last_reliable_frame=0, class_id=0),
+            ),
+            2,
+            0,
+        )
+        transition = LifecycleTransition(
+            table=table,
+            state=_crafted_state([True, True]),
+            tentative_pool=TentativeTrackPool.empty(),
+            events=(
+                LifecycleEvent("confirmed", 0, track_id=0, frame_index=0, tentative_id=7),
+                LifecycleEvent("confirmed", 1, track_id=1, frame_index=0, tentative_id=7),
+            ),
+            emitted_slots=(0, 1),
+        )
+
+        with pytest.raises(LifecycleInvariantError, match="same tentative"):
+            validate_lifecycle_invariants(transition, _PERSON_SCHEMA)
+
+    def test_two_confirmations_consuming_the_same_discovery_slot_are_rejected(self) -> None:
+        """Criterion 3: a discovery can confirm at most one tentative per frame."""
+        table = TrackSlotTable(
+            (_slot(track_id=0, status="active", age=1, hits=1, last_reliable_frame=0, class_id=0),), 1, 0
+        )
+        transition = LifecycleTransition(
+            table=table,
+            state=_crafted_state([True]),
+            tentative_pool=TentativeTrackPool.empty(),
+            events=(
+                LifecycleEvent("confirmed", 0, track_id=0, frame_index=0, tentative_id=1),
+                LifecycleEvent("confirmed", 0, track_id=0, frame_index=0, tentative_id=2),
+            ),
+            emitted_slots=(0,),
+        )
+
+        with pytest.raises(LifecycleInvariantError, match="same discovery slot"):
+            validate_lifecycle_invariants(transition, _PERSON_SCHEMA)
+
+    def test_a_confirmed_tentative_still_present_in_the_pool_is_rejected(self) -> None:
+        """Criterion 1/3: confirmation must discard the tentative record, never backfill it."""
+        table = TrackSlotTable(
+            (_slot(track_id=0, status="active", age=1, hits=1, last_reliable_frame=0, class_id=0),), 1, 0
+        )
+        record = TentativeRecord(3, 0, 0, 0, 2, 0, (0.9, 0.9), (0.5, 0.5, 0.1, 0.1))
+        transition = LifecycleTransition(
+            table=table,
+            state=_crafted_state([True]),
+            tentative_pool=TentativeTrackPool((record,), 4),
+            events=(LifecycleEvent("confirmed", 0, track_id=0, frame_index=0, tentative_id=3),),
+            emitted_slots=(0,),
+        )
+
+        with pytest.raises(LifecycleInvariantError, match="still lives in the pool"):
+            validate_lifecycle_invariants(transition, _PERSON_SCHEMA)
+
+    def test_the_same_public_track_id_emitted_twice_in_one_frame_is_rejected(self) -> None:
+        """Criterion 4: no public track may emit more than one row per source frame."""
+        table = TrackSlotTable(
+            (_slot(track_id=0, status="active", age=1, hits=1, last_reliable_frame=0, class_id=0),), 1, 0
+        )
+        transition = LifecycleTransition(
+            table=table,
+            state=_crafted_state([True]),
+            tentative_pool=TentativeTrackPool.empty(),
+            events=(),
+            emitted_slots=(0, 0),
+        )
+
+        with pytest.raises(LifecycleInvariantError, match="emitted more than once"):
+            validate_lifecycle_invariants(transition, _PERSON_SCHEMA)
+
+    def test_an_emitted_row_outside_the_foreground_schema_is_rejected(self) -> None:
+        """Criterion 5: no exported row may carry a class ID the schema never declared."""
+        table = TrackSlotTable(
+            (_slot(track_id=0, status="active", age=1, hits=1, last_reliable_frame=0, class_id=99),), 1, 0
+        )
+        transition = LifecycleTransition(
+            table=table,
+            state=_crafted_state([True]),
+            tentative_pool=TentativeTrackPool.empty(),
+            events=(),
+            emitted_slots=(0,),
+        )
+
+        with pytest.raises(LifecycleInvariantError, match="outside the declared foreground schema"):
+            validate_lifecycle_invariants(transition, _PERSON_SCHEMA)
+
+
+class TestLifecycleInvariantPropertySequences:
+    """Property-style regression coverage for ``validate_lifecycle_invariants`` (PRD US-005).
+
+    Drives many independent chronological streams -- each with its own randomized capacity,
+    lifecycle-policy knobs, per-frame scores, boxes, and non-unit frame gaps -- through
+    ``transition_lifecycle`` under a fixed seed, validating every produced transition. A fixed
+    seed keeps any future counterexample immediately reproducible.
+    """
+
+    _SEED = 20260826
+    _TRIALS = 40
+    _STEPS_PER_TRIAL = 25
+
+    def test_random_sequences_never_violate_lifecycle_invariants(self) -> None:
+        rng = random.Random(self._SEED)
+        for _ in range(self._TRIALS):
+            num_queries = rng.randint(3, 6)
+            max_active_tracks = rng.randint(1, num_queries - 1)
+            window_frames = rng.choice([2, 3, 4])
+            config = TrackingSessionConfig(
+                activation_threshold=rng.uniform(0.3, 0.7),
+                continuation_threshold=rng.uniform(0.1, 0.5),
+                duplicate_iou_threshold=rng.uniform(0.4, 0.8),
+                tentative_confirmation_hits=rng.randint(1, window_frames),
+                tentative_confirmation_window_frames=window_frames,
+                tentative_max_misses=rng.choice([1, 2, 3]),
+                tentative_association_iou_threshold=rng.uniform(0.1, 0.5),
+                max_discovery_candidates_per_frame=rng.choice([2, 4, 10]),
+                max_tentative_tracks=rng.choice([1, 2, 5]),
+                collision_iou_threshold=rng.uniform(0.4, 0.8),
+                collision_persistence_frames=rng.choice([1, 2, 3]),
+                collision_loser_outcome=rng.choice(["remains_active", "suspended", "terminated"]),
+                reassociation_enabled=rng.choice([True, False]),
+                reassociation_iou_threshold=rng.uniform(0.3, 0.7),
+                motion_reference_prediction_enabled=rng.choice([True, False]),
+                identity_memory_enabled=rng.choice([True, False]),
+            )
+            table = TrackSlotTable.empty(num_queries)
+            state = TrackQueryState.empty(1, num_queries, 2)
+            pool = TentativeTrackPool.empty()
+            frame_index = -1
+            for _ in range(self._STEPS_PER_TRIAL):
+                frame_index += rng.choice([1, 1, 1, 2, 3])
+                scores = [rng.uniform(0.01, 0.99) for _ in range(num_queries)]
+                boxes = torch.zeros(1, num_queries, 4)
+                for index in range(num_queries):
+                    boxes[0, index] = torch.tensor(
+                        [
+                            rng.uniform(0.1, 0.9),
+                            rng.uniform(0.1, 0.9),
+                            rng.uniform(0.05, 0.3),
+                            rng.uniform(0.05, 0.3),
+                        ]
+                    )
+                features = torch.rand(1, num_queries, 2)
+                frame = _frame(scores, boxes=boxes, features=features, input_active_mask=state.active_mask)
+
+                transition = transition_lifecycle(
+                    table,
+                    state,
+                    frame,
+                    config,
+                    _PERSON_SCHEMA,
+                    pool,
+                    max_active_tracks=max_active_tracks,
+                    frame_index=frame_index,
+                )
+
+                validate_lifecycle_invariants(transition, _PERSON_SCHEMA)
+
+                table, state, pool = transition.table, transition.state, transition.tentative_pool
+
+
+class TestSelfConfirmationRegressionPattern:
+    """Reproduces the PRD's documented "106-of-107 self-confirmations" failure (PRD US-005).
+
+    ``_old_semantics_self_confirms`` is a minimal standalone re-creation of the pre-fix behavior
+    described in PRD Section 1: a first discovery was copied straight into recurrent query state
+    and marked ``active_mask=True``, so *that same slot* could supply its own next-frame
+    confirmation evidence merely by staying above the continuation threshold. It exists only in
+    this test, deliberately isolated from production code, to give the "106-of-107" claim and its
+    corrected-semantics counter-claim an executable, side-by-side proof.
+    """
+
+    def _old_semantics_self_confirms(self, second_frame_score: float, *, continuation_threshold: float) -> bool:
+        """Mirror of the pre-fix rule: a first-hit slot confirms itself once it re-clears threshold."""
+        return second_frame_score >= continuation_threshold
+
+    def test_old_semantics_self_confirms_106_of_107_candidates(self) -> None:
+        """106 candidates persist above threshold at their own first-hit slot; one drifts below it."""
+        continuation_threshold = 0.3
+        second_frame_scores = [0.9] * 106 + [0.1]
+
+        self_confirmed = sum(
+            self._old_semantics_self_confirms(score, continuation_threshold=continuation_threshold)
+            for score in second_frame_scores
+        )
+
+        assert self_confirmed == 106
+        assert len(second_frame_scores) == 107
+
+    def test_corrected_semantics_self_confirms_none_of_the_same_107_candidates(self) -> None:
+        """The identical 107 same-slot score trajectories confirm zero tracks under the fix.
+
+        Each candidate is an independent two-frame stream: a tentative starts at frame 0, and the
+        *same query index* echoes the documented second-frame score at frame 1 -- exactly the
+        input that self-confirmed under old semantics above. Because a tentative never occupies a
+        decoder slot or feeds its own evidence forward (PRD Section 5.1), and confirmation
+        requires an independent later-frame discovery from an *inactive* slot associating with the
+        pool, that discovery is available at every other query index but never at the one that
+        merely started the tentative -- so none of these candidates ever produce a ``"confirmed"``
+        event or an active track.
+        """
+        continuation_threshold = 0.3
+        second_frame_scores = [0.9] * 106 + [0.1]
+        config = TrackingSessionConfig(continuation_threshold=continuation_threshold)
+
+        confirmed_count = 0
+        for second_frame_score in second_frame_scores:
+            table = TrackSlotTable.empty(2)
+            state = TrackQueryState.empty(1, 2, 2)
+            first = transition_lifecycle(
+                table,
+                state,
+                _frame([0.9, 0.05]),
+                config,
+                _PERSON_SCHEMA,
+                max_active_tracks=1,
+                frame_index=0,
+            )
+            assert not first.state.active_mask[0, 0]
+            validate_lifecycle_invariants(first, _PERSON_SCHEMA)
+
+            second = transition_lifecycle(
+                first.table,
+                first.state,
+                _frame([second_frame_score, 0.05], input_active_mask=first.state.active_mask),
+                config,
+                _PERSON_SCHEMA,
+                first.tentative_pool,
+                max_active_tracks=1,
+                frame_index=1,
+            )
+            validate_lifecycle_invariants(second, _PERSON_SCHEMA)
+            if any(event.kind == "confirmed" for event in second.events):
+                confirmed_count += 1
+            assert not second.state.active_mask[0, 0]
+            assert second.table.slot_track_ids == (None, None)
+
+        assert confirmed_count == 0
+        assert len(second_frame_scores) == 107

@@ -21,7 +21,14 @@ from PIL import Image
 
 from rfdetr.config import TrackingPolicy, TrackingSessionConfig
 from rfdetr.models.tracking import TrackQueryState
-from rfdetr.tracking.lifecycle import LifecycleEvent, TrackSlot, TrackSlotTable, transition_lifecycle
+from rfdetr.tracking.lifecycle import (
+    CollisionArbitrationEvent,
+    LifecycleEvent,
+    TentativeTrackPool,
+    TrackSlot,
+    TrackSlotTable,
+    transition_lifecycle,
+)
 
 if TYPE_CHECKING:
     from supervision import Detections
@@ -109,9 +116,11 @@ class TrackingSession:
         else:
             self._config = config or TrackingSessionConfig()
         self._table = TrackSlotTable.empty(model.model_config.num_queries)
+        self._tentative_pool = TentativeTrackPool.empty()
         self._state: TrackQueryState | None = None
         self._next_frame_index = 0
         self._last_events: tuple[LifecycleEvent, ...] = ()
+        self._last_collision_events: tuple[CollisionArbitrationEvent, ...] = ()
         self._last_timing: TrackingTiming | None = None
         self._last_frame_output: TrackingFrameOutput | None = None
 
@@ -126,9 +135,19 @@ class TrackingSession:
         return tuple(slot for slot in self._table.slots if slot.status in {"active", "suspended"})
 
     @property
+    def tentative_pool(self) -> TentativeTrackPool:
+        """Return an immutable snapshot of candidates awaiting confirmation."""
+        return self._tentative_pool
+
+    @property
     def last_events(self) -> tuple[LifecycleEvent, ...]:
         """Return lifecycle diagnostics emitted by the most recent update."""
         return self._last_events
+
+    @property
+    def last_collision_events(self) -> tuple[CollisionArbitrationEvent, ...]:
+        """Return active-track duplicate-collision diagnostics from the most recent update."""
+        return self._last_collision_events
 
     @property
     def last_timing(self) -> TrackingTiming | None:
@@ -143,9 +162,11 @@ class TrackingSession:
     def reset(self) -> None:
         """Clear neural and host state and restart session-local IDs at zero."""
         self._table = TrackSlotTable.empty(self._model.model_config.num_queries)
+        self._tentative_pool = TentativeTrackPool.empty()
         self._state = None
         self._next_frame_index = 0
         self._last_events = ()
+        self._last_collision_events = ()
         self._last_timing = None
         self._last_frame_output = None
 
@@ -212,17 +233,24 @@ class TrackingSession:
             frame_output,
             self._config,
             self._model.model_config.class_schema,
+            self._tentative_pool,
             max_active_tracks=self._model.model_config.tracking.active_capacity(self._model.model_config.num_queries),
             frame_index=frame_index,
         )
         self._last_frame_output = frame_output
         self._table = transition.table
         self._state = transition.state
+        self._tentative_pool = transition.tentative_pool
         self._last_events = transition.events
+        self._last_collision_events = transition.collision_events
         self._next_frame_index = frame_index + 1
         lifecycle_finished_at = self._timing_mark()
 
-        visible_slots = [index for index, slot in enumerate(self._table.slots) if slot.status == "active"]
+        # Emission uses transition.emitted_slots (active slots minus this frame's
+        # duplicate-collision losers) rather than raw slot status, so an arbitrated loser's
+        # observation is excluded from MOT/COCO export even while its lifecycle state remains
+        # untouched (PRD Section 5.2).
+        visible_slots = list(transition.emitted_slots)
         height, width = original_size
         if visible_slots:
             boxes = self._state.reference_boxes[0, visible_slots]
@@ -250,6 +278,7 @@ class TrackingSession:
         detections.metadata["frame_index"] = frame_index
         detections.metadata["timestamp"] = timestamp
         detections.metadata["lifecycle_events"] = self._last_events
+        detections.metadata["collision_events"] = self._last_collision_events
         finished_at = self._timing_mark()
         if started_at is not None:
             assert preprocessed_at is not None

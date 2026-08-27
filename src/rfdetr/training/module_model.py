@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import math
 import random
+import time
 import warnings
+from collections import Counter
 from collections.abc import Sequence
 from dataclasses import replace
-from typing import Any
+from typing import Any, get_args
 
 import torch
 import torch.nn.functional as F  # noqa: N812 -- project-conventional alias (see AGENTS.md)
@@ -25,9 +27,10 @@ from rfdetr.models.lwdetr import build_criterion_from_config, build_model_from_c
 from rfdetr.models.matcher import SequenceAssignment, identity_aware_sequence_assignment
 from rfdetr.models.tracking import TrackingFrameOutput, TrackQueryState
 from rfdetr.models.weights import apply_lora, interpolate_position_embeddings, load_pretrain_weights
-from rfdetr.tracking.lifecycle import TrackSlotTable, transition_lifecycle
+from rfdetr.tracking.lifecycle import EventKind, TrackSlotTable, transition_lifecycle
 from rfdetr.training.checkpoint import authoritative_checkpoint_metadata, source_checkpoint_hash
 from rfdetr.training.param_groups import get_param_dict
+from rfdetr.utilities.box_ops import box_cxcywh_to_xyxy, box_iou
 from rfdetr.utilities.logger import get_logger
 
 logger = get_logger()
@@ -35,6 +38,27 @@ logger = get_logger()
 _FALSE_POSITIVE_INJECTION_SALT = 1
 _QUERY_DROPOUT_SALT = 2
 _ERROR_EXPOSURE_LOGIT_MAGNITUDE = 8.0
+
+# Duplicate-FP PRD US-011 sampling composition: a supervised persistent transition counts as a
+# "partial visibility" event when a track that stays present across the transition shrinks below
+# this fraction of the largest normalized box area it reached earlier in the clip's supervised
+# suffix -- an annotation-free occlusion proxy for datasets (DanceTrack) that carry no visibility
+# field.
+_PARTIAL_VISIBILITY_AREA_FRACTION = 0.5
+
+# Every sampling-composition transition category reported per training step (US-011 AC).
+_SAMPLING_TRANSITION_KINDS: tuple[str, ...] = (
+    "departure",
+    "re_entry",
+    "partial_visibility",
+    "injected_fp",
+    "query_dropout",
+)
+
+# Every prediction-driven lifecycle transition kind, logged per training step so
+# incorrect births, missed continuations, suspensions, confirmations, and
+# terminations are visible during training (duplicate-FP PRD US-009).
+_LIFECYCLE_EVENT_KINDS: tuple[str, ...] = get_args(EventKind)
 
 _TRAIN_PROGRESS_LOSS_ALIASES: dict[str, str] = {
     "loss_ce": "loss_cls",
@@ -80,6 +104,33 @@ class RFDETRModelModule(LightningModule):
         # Allow partial state-dict loading when resuming from a .pth checkpoint
         # (which contains only model weights, not criterion/postprocess state).
         self.strict_loading = False
+
+        # Duplicate-FP PRD US-009 lifecycle-commitment diagnostics, recomputed
+        # per training step. ``_lifecycle_commit_frames`` counts supervised
+        # frame-item commits by curriculum stage; ``_lifecycle_transition_counts``
+        # tallies every prediction-driven lifecycle event kind. Both are reset at
+        # the start of every ``_unroll_tracking_clip`` and logged by
+        # ``_training_step_tracking``.
+        self._lifecycle_commit_frames: dict[str, int] = {"oracle": 0, "prediction_driven": 0}
+        self._lifecycle_transition_counts: Counter[str] = Counter()
+
+        # Duplicate-FP PRD US-010 error-exposure diagnostics, recomputed per training step.
+        # ``_error_exposure_diagnostics`` accumulates attempted/applied counts plus running
+        # sums for score, ground-truth overlap, capacity pressure, and lifetime;
+        # ``_injected_track_records`` follows each injected false-positive track across the
+        # clip so its lifetime and cancellation outcome can be reported. Both are reset at
+        # the start of every ``_unroll_tracking_clip`` and logged by ``_training_step_tracking``.
+        self._error_exposure_diagnostics: dict[str, float] = self._empty_error_exposure_diagnostics()
+        self._injected_track_records: dict[tuple[int, int], dict[str, Any]] = {}
+
+        # Duplicate-FP PRD US-011 sampling composition, recomputed per training step. Counts how
+        # many of this step's supervised persistent transitions (one per supervised frame-step
+        # after the first, aggregated over batch items) contained a track departure, a track
+        # re-entry, a partial-visibility shrink, an injected false-positive slot, or a dropped
+        # genuine query -- so a longer-horizon clip's realized error exposure is measurable, not
+        # assumed. Reset at the start of every ``_unroll_tracking_clip``; logged by
+        # ``_training_step_tracking``.
+        self._sampling_transition_diagnostics: dict[str, float] = self._empty_sampling_transition_diagnostics()
 
         # Model, criterion, and postprocessor.
         self.model = build_model_from_config(model_config, train_config)
@@ -374,29 +425,66 @@ class RFDETRModelModule(LightningModule):
                     committed_ids[query_index] = proposed_id
 
             next_ids.append(tuple(committed_ids))
-            active_masks.append(
-                torch.tensor([value is not None for value in committed_ids], device=features.device)
-            )
+            active_masks.append(torch.tensor([value is not None for value in committed_ids], device=features.device))
 
         return TrackQueryState(features, boxes, torch.stack(active_masks).bool()), next_ids
 
     def _error_exposure_draws(
-        self, *, salt: int, frame_index: int, batch_index: int, count: int
+        self, *, salt: int, frame_index: int, batch_index: int, query_indices: Sequence[int]
     ) -> list[float]:
-        """Deterministic uniform draws for one frame/batch-item/mechanism triple (PRD US-019).
+        """One deterministic uniform draw per query index (duplicate-FP PRD US-010).
 
-        Seeded only from ``TrackingTrainConfig.error_exposure_seed`` plus the salt, frame, and
-        batch indices -- never from global RNG state -- so injection/dropout decisions are
-        reproducible across repeated runs regardless of dataloader shuffling or other
-        randomness consumed earlier in the step.
+        Each draw is seeded independently from ``TrackingTrainConfig.error_exposure_seed``
+        plus ``(salt, frame_index, batch_index, query_index)`` -- never from a shared
+        per-frame vector or from global RNG state -- so a slot's draw is identical
+        regardless of how many other slots are eligible that frame, in what order they are
+        considered, or what randomness earlier training code consumed.
         """
-        if count <= 0:
-            return []
         base_seed = self.train_config.tracking.error_exposure_seed
-        combined_seed = ((base_seed * 1_000_003 + salt) * 1_000_003 + frame_index) * 1_000_003 + batch_index
-        generator = torch.Generator(device="cpu")
-        generator.manual_seed(combined_seed % (2**63 - 1))
-        return torch.rand(count, generator=generator).tolist()
+        prefix = ((base_seed * 1_000_003 + salt) * 1_000_003 + frame_index) * 1_000_003 + batch_index
+        draws: list[float] = []
+        for query_index in query_indices:
+            generator = torch.Generator(device="cpu")
+            generator.manual_seed((prefix * 1_000_003 + query_index) % (2**63 - 1))
+            draws.append(float(torch.rand(1, generator=generator).item()))
+        return draws
+
+    def _false_positive_injection_plan(
+        self,
+        table: TrackSlotTable,
+        assignment: SequenceAssignment,
+        *,
+        frame_index: int,
+        batch_index: int,
+        probability: float,
+        max_count: int,
+    ) -> tuple[list[int], list[int], list[int]]:
+        """Return ``(eligible, attempted, selected)`` query indices for false-positive injection.
+
+        ``eligible`` are query positions with no correspondence at all in ``assignment``
+        (neither continuing nor discovery -- genuine "unmatched query states"), restricted to
+        currently inactive slots so injection creates a new synthetic false-positive track
+        rather than altering an already-tracked identity. ``attempted`` are the eligible slots
+        whose per-query draw falls under ``probability``; ``selected`` keeps the lowest-drawn
+        ``max_count`` of those (the remaining per-sample budget). All three are deterministic
+        given the seed.
+        """
+        matched = set(assignment.decoder_indices[0].tolist())
+        eligible = [
+            index for index, slot in enumerate(table.slots) if slot.status == "inactive" and index not in matched
+        ]
+        if not eligible:
+            return [], [], []
+        draws = self._error_exposure_draws(
+            salt=_FALSE_POSITIVE_INJECTION_SALT,
+            frame_index=frame_index,
+            batch_index=batch_index,
+            query_indices=eligible,
+        )
+        ranked = sorted(zip(eligible, draws), key=lambda pair: pair[1])
+        attempted = [index for index, draw in ranked if draw < probability]
+        selected = attempted[:max_count] if max_count > 0 else []
+        return eligible, attempted, selected
 
     def _select_false_positive_injection_indices(
         self,
@@ -408,26 +496,47 @@ class RFDETRModelModule(LightningModule):
         probability: float,
         max_count: int,
     ) -> list[int]:
-        """Select ground-truth-unmatched inactive slots to force-activate this frame.
+        """Select ground-truth-unmatched inactive slots to force-activate this frame."""
+        return self._false_positive_injection_plan(
+            table,
+            assignment,
+            frame_index=frame_index,
+            batch_index=batch_index,
+            probability=probability,
+            max_count=max_count,
+        )[2]
 
-        Candidates are query positions with no correspondence at all in ``assignment`` (neither
-        continuing nor discovery) -- genuine "unmatched query states" -- restricted to currently
-        inactive slots so injection creates a new synthetic false-positive track rather than
-        altering an already-tracked identity. Selection is capped at ``max_count`` (the
-        remaining per-sample injection budget) by keeping the lowest-drawn eligible candidates,
-        which is deterministic given the seeded draws.
+    def _query_dropout_plan(
+        self,
+        table: TrackSlotTable,
+        *,
+        frame_index: int,
+        batch_index: int,
+        probability: float,
+    ) -> tuple[list[int], list[int], list[int]]:
+        """Return ``(candidates, attempted, selected)`` query indices for query dropout.
+
+        ``candidates`` are currently active slots; ``attempted`` are those whose per-query
+        draw falls under ``probability``; ``selected`` is ``attempted`` minus the guard-spared
+        survivor (the highest-drawn candidate) whenever every candidate was attempted, so a
+        sample can never lose all active identities to dropout in one frame.
         """
-        if max_count <= 0:
-            return []
-        matched = set(assignment.decoder_indices[0].tolist())
-        candidates = [index for index, slot in enumerate(table.slots) if slot.status == "inactive" and index not in matched]
+        candidates = [index for index, slot in enumerate(table.slots) if slot.status == "active"]
         if not candidates:
-            return []
+            return [], [], []
         draws = self._error_exposure_draws(
-            salt=_FALSE_POSITIVE_INJECTION_SALT, frame_index=frame_index, batch_index=batch_index, count=len(candidates)
+            salt=_QUERY_DROPOUT_SALT,
+            frame_index=frame_index,
+            batch_index=batch_index,
+            query_indices=candidates,
         )
-        ranked = sorted(zip(candidates, draws), key=lambda pair: pair[1])
-        return [index for index, draw in ranked if draw < probability][:max_count]
+        paired = list(zip(candidates, draws))
+        attempted = [index for index, draw in paired if draw < probability]
+        selected = list(attempted)
+        if len(selected) == len(candidates):
+            survivor_index = max(paired, key=lambda pair: pair[1])[0]
+            selected = [index for index in selected if index != survivor_index]
+        return candidates, attempted, selected
 
     def _select_query_dropout_indices(
         self,
@@ -437,24 +546,10 @@ class RFDETRModelModule(LightningModule):
         batch_index: int,
         probability: float,
     ) -> list[int]:
-        """Select active slots to force a missed-detection score this frame.
-
-        Never selects every currently active slot: if every draw qualifies, the
-        least-confidently-dropped index (highest draw) is spared so a sample can never lose
-        all active identities to dropout in one frame.
-        """
-        candidates = [index for index, slot in enumerate(table.slots) if slot.status == "active"]
-        if not candidates:
-            return []
-        draws = self._error_exposure_draws(
-            salt=_QUERY_DROPOUT_SALT, frame_index=frame_index, batch_index=batch_index, count=len(candidates)
-        )
-        paired = list(zip(candidates, draws))
-        selected = [index for index, draw in paired if draw < probability]
-        if len(selected) == len(candidates):
-            survivor_index = max(paired, key=lambda pair: pair[1])[0]
-            selected = [index for index in selected if index != survivor_index]
-        return selected
+        """Select active slots to force a missed-detection score this frame."""
+        return self._query_dropout_plan(
+            table, frame_index=frame_index, batch_index=batch_index, probability=probability
+        )[2]
 
     def _inject_false_positive_scores(
         self, frame: TrackingFrameOutput, indices: Sequence[int], class_schema: ClassSchema
@@ -483,6 +578,60 @@ class RFDETRModelModule(LightningModule):
                 pred_logits[0, index, class_schema.background_logit_index] = _ERROR_EXPOSURE_LOGIT_MAGNITUDE
         return replace(frame, pred_logits=pred_logits)
 
+    @staticmethod
+    def _empty_error_exposure_diagnostics() -> dict[str, float]:
+        """Zeroed accumulator for one training step's error-exposure diagnostics (US-010)."""
+        return {
+            "fp_injection_attempted": 0.0,
+            "fp_injection_applied": 0.0,
+            "fp_injection_tracked": 0.0,
+            "fp_injection_cancelled": 0.0,
+            "fp_injection_score_sum": 0.0,
+            "fp_injection_target_iou_sum": 0.0,
+            "fp_injection_capacity_pressure_sum": 0.0,
+            "fp_injection_lifetime_sum": 0.0,
+            "query_dropout_attempted": 0.0,
+            "query_dropout_applied": 0.0,
+            "query_dropout_score_sum": 0.0,
+            "query_dropout_target_iou_sum": 0.0,
+            "query_dropout_lifetime_sum": 0.0,
+        }
+
+    def _error_exposure_curriculum_factor(self) -> float:
+        """Current warm-up-then-ramp multiplier for the error-exposure sampling rates (US-010).
+
+        Deterministic from ``trainer.current_epoch`` / ``trainer.global_step`` so repeated runs
+        and resumes agree. ``mode="disabled"`` (the default) always returns ``1.0``, leaving
+        every pre-existing configuration unchanged.
+        """
+        curriculum = self.train_config.tracking.error_exposure_curriculum
+        trainer = getattr(self, "_trainer", None)
+        return curriculum.factor_at(
+            epoch=int(getattr(trainer, "current_epoch", 0) or 0),
+            step=int(getattr(trainer, "global_step", 0) or 0),
+        )
+
+    def _error_exposure_slot_metrics(
+        self,
+        base_frame: TrackingFrameOutput,
+        query_index: int,
+        gt_boxes_xyxy: torch.Tensor | None,
+        class_schema: ClassSchema,
+    ) -> tuple[float, float]:
+        """Return ``(foreground_score, max_ground_truth_iou)`` for one perturbed slot (US-010).
+
+        The score and box are read from ``base_frame`` -- the model's *un-perturbed* output for
+        this slot -- so the logged diagnostics describe the genuine prediction that injection or
+        dropout overrode, not the synthetic magnitude written on top of it.
+        """
+        probs = base_frame.pred_logits[0, query_index].detach().softmax(-1)
+        foreground_score = float(probs[list(class_schema.foreground_class_ids)].max())
+        if gt_boxes_xyxy is None or gt_boxes_xyxy.numel() == 0:
+            return foreground_score, 0.0
+        pred_xyxy = box_cxcywh_to_xyxy(base_frame.pred_boxes[0, query_index].detach().unsqueeze(0))
+        iou, _ = box_iou(pred_xyxy, gt_boxes_xyxy)
+        return foreground_score, float(iou.max())
+
     def _commit_tracking_state_inference_like(
         self,
         frame: TrackingFrameOutput,
@@ -492,6 +641,8 @@ class RFDETRModelModule(LightningModule):
         *,
         frame_index: int,
         fp_injection_remaining: list[int] | None = None,
+        record_diagnostics: bool = False,
+        frame_targets: Sequence[Any] | None = None,
     ) -> tuple[TrackQueryState, list[tuple[int | None, ...]], list[TrackSlotTable]]:
         """Commit state through the exact deployment lifecycle state machine.
 
@@ -502,11 +653,12 @@ class RFDETRModelModule(LightningModule):
         see -- and learn to recover from -- the model's own false positives, false negatives,
         and stale suspended references instead of having ground truth silently repair them.
 
-        ``assignments`` is consulted only by the optional PRD US-019 error-exposure pilots
-        (``false_positive_injection_enabled`` / ``query_dropout_enabled``), which perturb the
-        *candidate scores* fed into ``transition_lifecycle`` -- never the lifecycle decision
-        itself -- to select which ground-truth-unmatched candidates get force-activated or which
-        active slots get force-dropped this frame, deterministically.
+        ``assignments`` is consulted only by the optional error-exposure pilots
+        (``false_positive_injection_enabled`` / ``query_dropout_enabled``, duplicate-FP PRD
+        US-010), which perturb the *candidate scores* fed into ``transition_lifecycle`` -- never
+        the lifecycle decision itself -- to select which ground-truth-unmatched candidates get
+        force-activated or which active slots get force-dropped this frame, deterministically.
+        ``frame_targets`` supplies ground-truth boxes for the target-overlap diagnostic only.
         """
         if self.model_config.class_schema is None:
             raise ValueError("prediction-driven tracking requires an authoritative class_schema")
@@ -514,6 +666,10 @@ class RFDETRModelModule(LightningModule):
         tracking_config = self.train_config.tracking
         lifecycle_config = tracking_config.lifecycle
         capacity = self.model_config.tracking.active_capacity(self.model_config.num_queries)
+        exposure_factor = self._error_exposure_curriculum_factor()
+        fp_probability = tracking_config.false_positive_injection_probability * exposure_factor
+        dropout_probability = tracking_config.query_dropout_probability * exposure_factor
+        diagnostics = self._error_exposure_diagnostics
 
         next_tables: list[TrackSlotTable] = []
         next_ids: list[tuple[int | None, ...]] = []
@@ -527,30 +683,60 @@ class RFDETRModelModule(LightningModule):
                 prior_state.reference_boxes[batch_index : batch_index + 1],
                 prior_state.active_mask[batch_index : batch_index + 1],
             )
-            item_frame = self._slice_frame_output(frame, batch_index)
+            base_frame = self._slice_frame_output(frame, batch_index)
+            item_frame = base_frame
+            gt_boxes_xyxy: torch.Tensor | None = None
+            if frame_targets is not None:
+                gt_boxes = frame_targets[batch_index]["boxes"].detach()
+                gt_boxes_xyxy = box_cxcywh_to_xyxy(gt_boxes) if gt_boxes.numel() else gt_boxes.new_zeros((0, 4))
+            active_count = sum(1 for slot in table.slots if slot.status == "active")
+            capacity_pressure = active_count / capacity if capacity else 0.0
+            injected: list[int] = []
 
             if tracking_config.false_positive_injection_enabled and fp_injection_remaining is not None:
-                injected = self._select_false_positive_injection_indices(
+                eligible, attempted, injected = self._false_positive_injection_plan(
                     table,
                     assignments[batch_index],
                     frame_index=frame_index,
                     batch_index=batch_index,
-                    probability=tracking_config.false_positive_injection_probability,
+                    probability=fp_probability,
                     max_count=fp_injection_remaining[batch_index],
                 )
+                if record_diagnostics:
+                    diagnostics["fp_injection_attempted"] += len(attempted)
                 if injected:
                     item_frame = self._inject_false_positive_scores(item_frame, injected, class_schema)
                     fp_injection_remaining[batch_index] -= len(injected)
+                    if record_diagnostics:
+                        diagnostics["fp_injection_applied"] += len(injected)
+                        for query_index in injected:
+                            score, overlap = self._error_exposure_slot_metrics(
+                                base_frame, query_index, gt_boxes_xyxy, class_schema
+                            )
+                            diagnostics["fp_injection_score_sum"] += score
+                            diagnostics["fp_injection_target_iou_sum"] += overlap
+                            diagnostics["fp_injection_capacity_pressure_sum"] += capacity_pressure
 
             if tracking_config.query_dropout_enabled:
-                dropped = self._select_query_dropout_indices(
+                _candidates, dropout_attempted, dropped = self._query_dropout_plan(
                     table,
                     frame_index=frame_index,
                     batch_index=batch_index,
-                    probability=tracking_config.query_dropout_probability,
+                    probability=dropout_probability,
                 )
+                if record_diagnostics:
+                    diagnostics["query_dropout_attempted"] += len(dropout_attempted)
                 if dropped:
                     item_frame = self._apply_query_dropout_scores(item_frame, dropped, class_schema)
+                    if record_diagnostics:
+                        diagnostics["query_dropout_applied"] += len(dropped)
+                        for query_index in dropped:
+                            score, overlap = self._error_exposure_slot_metrics(
+                                base_frame, query_index, gt_boxes_xyxy, class_schema
+                            )
+                            diagnostics["query_dropout_score_sum"] += score
+                            diagnostics["query_dropout_target_iou_sum"] += overlap
+                            diagnostics["query_dropout_lifetime_sum"] += float(table.slots[query_index].age)
 
             transition = transition_lifecycle(
                 table,
@@ -561,6 +747,11 @@ class RFDETRModelModule(LightningModule):
                 max_active_tracks=capacity,
                 frame_index=frame_index,
             )
+            if record_diagnostics:
+                self._lifecycle_transition_counts.update(event.kind for event in transition.events)
+                self._update_injected_track_records(
+                    batch_index, transition.table, injected if fp_injection_remaining is not None else [], frame_index
+                )
             next_tables.append(transition.table)
             next_ids.append(transition.table.slot_track_ids)
             features.append(transition.state.query_features)
@@ -569,6 +760,198 @@ class RFDETRModelModule(LightningModule):
 
         state = TrackQueryState(torch.cat(features, dim=0), torch.cat(boxes, dim=0), torch.cat(active_masks, dim=0))
         return state, next_ids, next_tables
+
+    def _update_injected_track_records(
+        self,
+        batch_index: int,
+        table: TrackSlotTable,
+        injected_query_indices: Sequence[int],
+        frame_index: int,
+    ) -> None:
+        """Follow each injected false-positive track across the clip for the US-010 diagnostics.
+
+        A record is opened for every injected slot that the lifecycle actually activated. On
+        every later frame the record is either extended (the slot is still that active track)
+        or closed as *cancelled* -- the lifecycle suspended, terminated, or recycled the
+        synthetic track. Records still open at the clip boundary are survivors, not
+        cancellations.
+        """
+        for (record_batch, query_index), record in self._injected_track_records.items():
+            if record_batch != batch_index or record["closed"] or record["birth_frame"] >= frame_index:
+                continue
+            slot = table.slots[query_index]
+            if slot.status == "active" and slot.track_id == record["track_id"]:
+                record["last_seen_frame"] = frame_index
+            else:
+                record["closed"] = True
+                record["cancelled"] = True
+
+        for query_index in injected_query_indices:
+            slot = table.slots[query_index]
+            if slot.status == "active" and slot.track_id is not None:
+                self._injected_track_records[(batch_index, query_index)] = {
+                    "track_id": slot.track_id,
+                    "birth_frame": frame_index,
+                    "last_seen_frame": frame_index,
+                    "closed": False,
+                    "cancelled": False,
+                }
+
+    def _finalize_error_exposure_diagnostics(self) -> None:
+        """Fold the per-clip injected-track records into the logged lifetime/cancellation totals."""
+        diagnostics = self._error_exposure_diagnostics
+        for record in self._injected_track_records.values():
+            diagnostics["fp_injection_tracked"] += 1.0
+            diagnostics["fp_injection_lifetime_sum"] += record["last_seen_frame"] - record["birth_frame"] + 1
+            if record["cancelled"]:
+                diagnostics["fp_injection_cancelled"] += 1.0
+
+    @staticmethod
+    def _empty_sampling_transition_diagnostics() -> dict[str, float]:
+        """Zeroed accumulator for one training step's sampling-composition report (US-011)."""
+        counts = {"supervised_transition_steps": 0.0}
+        counts.update({f"{kind}_steps": 0.0 for kind in _SAMPLING_TRANSITION_KINDS})
+        return counts
+
+    def _accumulate_sampling_transition_composition(
+        self,
+        *,
+        supervised_targets: Sequence[Sequence[Any]],
+        injection_flags: Sequence[bool],
+        dropout_flags: Sequence[bool],
+    ) -> None:
+        """Tally which supervised persistent transitions this clip actually exercised (US-011 AC).
+
+        A supervised persistent transition is one supervised frame-step after the first: the clip
+        carries recurrent state from the previous supervised frame into it. For every such step
+        this records whether -- across any batch item -- the ground truth shows a track
+        **departure** (an identity present last step is gone), a track **re_entry** (an identity
+        absent last step reappears having been seen earlier in the suffix), or a
+        **partial_visibility** shrink (a surviving identity drops below
+        :data:`_PARTIAL_VISIBILITY_AREA_FRACTION` of its earlier peak box area), and whether the
+        error-exposure pilots committed an **injected_fp** slot or a **query_dropout** on that
+        step. Denominator and numerators are logged so a longer-horizon clip's realized exposure
+        to disappearance/re-entry/occlusion is measurable rather than assumed.
+
+        Args:
+            supervised_targets: Time-major per-supervised-frame target-dict lists (one list per
+                batch item), i.e. ``target_batches`` restricted to the supervised suffix.
+            injection_flags: Per-supervised-frame flag, ``True`` when the lifecycle committed at
+                least one injected false-positive slot on that frame.
+            dropout_flags: Per-supervised-frame flag, ``True`` when the lifecycle forced at least
+                one active slot to look dropped on that frame.
+        """
+        diagnostics = self._sampling_transition_diagnostics
+        num_steps = len(supervised_targets)
+        if num_steps == 0:
+            return
+        batch_size = len(supervised_targets[0])
+
+        def _frame_maps(target: Any) -> tuple[set[int], dict[int, float]]:
+            boxes = target["boxes"]
+            present: set[int] = set()
+            areas: dict[int, float] = {}
+            for row, raw_id in enumerate(target["track_ids"]):
+                if raw_id is None:
+                    continue
+                track_id = int(raw_id)
+                present.add(track_id)
+                if row < len(boxes):
+                    area = float(boxes[row, 2]) * float(boxes[row, 3])
+                    areas[track_id] = max(areas.get(track_id, 0.0), area)
+            return present, areas
+
+        seen_ids: list[set[int]] = [set() for _ in range(batch_size)]
+        peak_area: list[dict[int, float]] = [{} for _ in range(batch_size)]
+        for item in range(batch_size):
+            present, areas = _frame_maps(supervised_targets[0][item])
+            seen_ids[item].update(present)
+            for track_id, area in areas.items():
+                peak_area[item][track_id] = max(peak_area[item].get(track_id, 0.0), area)
+
+        for step in range(1, num_steps):
+            diagnostics["supervised_transition_steps"] += 1.0
+            step_flags = {"departure": False, "re_entry": False, "partial_visibility": False}
+            for item in range(batch_size):
+                prev_present, _ = _frame_maps(supervised_targets[step - 1][item])
+                cur_present, cur_areas = _frame_maps(supervised_targets[step][item])
+                if prev_present - cur_present:
+                    step_flags["departure"] = True
+                if (cur_present - prev_present) & seen_ids[item]:
+                    step_flags["re_entry"] = True
+                for track_id in prev_present & cur_present:
+                    baseline = peak_area[item].get(track_id, 0.0)
+                    if baseline > 0.0 and cur_areas.get(track_id, 0.0) < _PARTIAL_VISIBILITY_AREA_FRACTION * baseline:
+                        step_flags["partial_visibility"] = True
+                seen_ids[item].update(cur_present)
+                for track_id, area in cur_areas.items():
+                    peak_area[item][track_id] = max(peak_area[item].get(track_id, 0.0), area)
+            for kind, hit in step_flags.items():
+                if hit:
+                    diagnostics[f"{kind}_steps"] += 1.0
+            if step < len(injection_flags) and injection_flags[step]:
+                diagnostics["injected_fp_steps"] += 1.0
+            if step < len(dropout_flags) and dropout_flags[step]:
+                diagnostics["query_dropout_steps"] += 1.0
+
+    def _log_sampling_transition_diagnostics(self, *, batch_size: int) -> None:
+        """Log this step's supervised-transition composition (US-011 AC).
+
+        ``train/sampling_transition_<kind>_fraction`` is the share of the step's supervised
+        persistent transitions that contained at least one event of that kind (departure,
+        re-entry, partial visibility, injected FP, query dropout); the raw
+        ``train/sampling_transition_<kind>_steps`` counts and the
+        ``train/sampling_transition_supervised_steps`` denominator are logged alongside so the
+        proportions are never reported without the counts that produced them.
+        """
+        diagnostics = self._sampling_transition_diagnostics
+        total = diagnostics["supervised_transition_steps"]
+        log_kwargs = dict(
+            on_step=self.train_config.train_log_on_step,
+            on_epoch=True,
+            sync_dist=self.train_config.train_log_sync_dist,
+            batch_size=batch_size,
+        )
+        self.log("train/sampling_transition_supervised_steps", float(total), **log_kwargs)
+        for kind in _SAMPLING_TRANSITION_KINDS:
+            steps = diagnostics[f"{kind}_steps"]
+            self.log(f"train/sampling_transition_{kind}_steps", float(steps), **log_kwargs)
+            self.log(
+                f"train/sampling_transition_{kind}_fraction",
+                float(steps / total) if total else 0.0,
+                **log_kwargs,
+            )
+
+    def _log_tracking_step_perf_metrics(
+        self,
+        *,
+        unroll_seconds: float,
+        peak_vram_bytes: int,
+        processed_frames: int,
+        gradient_bearing_frames: int,
+        batch_size: int,
+    ) -> None:
+        """Log this step's throughput, step time, peak VRAM, and frame budget (US-011 AC).
+
+        ``unroll_seconds`` times the causal clip unroll (every forwarded frame plus its lifecycle
+        commit) -- the tracking-specific work of the step, excluding the optimizer/backward that
+        Lightning runs after ``training_step`` returns. ``processed_frames`` is every forwarded
+        frame including burn-in (``batch_size * clip_length``); ``gradient_bearing_frames`` is the
+        loss-producing suffix only (``batch_size * supervised_frames``); throughput is
+        ``processed_frames / unroll_seconds``. ``peak_vram_bytes`` is ``0`` off CUDA.
+        """
+        throughput = processed_frames / unroll_seconds if unroll_seconds > 0 else 0.0
+        log_kwargs = dict(
+            on_step=self.train_config.train_log_on_step,
+            on_epoch=True,
+            sync_dist=self.train_config.train_log_sync_dist,
+            batch_size=batch_size,
+        )
+        self.log("train/perf_step_time_seconds", float(unroll_seconds), **log_kwargs)
+        self.log("train/perf_processed_frames", float(processed_frames), **log_kwargs)
+        self.log("train/perf_gradient_bearing_frames", float(gradient_bearing_frames), **log_kwargs)
+        self.log("train/perf_throughput_frames_per_second", float(throughput), **log_kwargs)
+        self.log("train/perf_peak_vram_bytes", float(peak_vram_bytes), **log_kwargs)
 
     def _commit_tracking_state(
         self,
@@ -581,6 +964,8 @@ class RFDETRModelModule(LightningModule):
         frame_index: int,
         inference_like: bool,
         fp_injection_remaining: list[int] | None = None,
+        record_diagnostics: bool = False,
+        frame_targets: Sequence[Any] | None = None,
     ) -> tuple[TrackQueryState, list[tuple[int | None, ...]], list[TrackSlotTable] | None]:
         """Commit one frame's recurrent state under the configured clip lifecycle.
 
@@ -605,6 +990,13 @@ class RFDETRModelModule(LightningModule):
                 control.
             fp_injection_remaining: Per-item remaining false-positive-injection budget for the
                 whole clip, mutated in place. ``None`` when injection is disabled.
+            record_diagnostics: When ``True`` (supervised frames only), every prediction-driven
+                lifecycle event kind is tallied into ``self._lifecycle_transition_counts`` and
+                the error-exposure diagnostics are accumulated, for per-step logging
+                (duplicate-FP PRD US-009/US-010). Has no effect in assignment-guided mode,
+                which emits no lifecycle events.
+            frame_targets: Per-item target dicts for this frame, used only to compute the
+                ground-truth-overlap error-exposure diagnostic. ``None`` disables that metric.
 
         Returns:
             Committed state, the next slot identity table, and the next lifecycle host state
@@ -614,7 +1006,14 @@ class RFDETRModelModule(LightningModule):
             if tables is None:
                 raise ValueError("inference-like tracking requires per-item lifecycle tables")
             state, next_ids, next_tables = self._commit_tracking_state_inference_like(
-                frame, assignments, prior_state, tables, frame_index=frame_index, fp_injection_remaining=fp_injection_remaining
+                frame,
+                assignments,
+                prior_state,
+                tables,
+                frame_index=frame_index,
+                fp_injection_remaining=fp_injection_remaining,
+                record_diagnostics=record_diagnostics,
+                frame_targets=frame_targets,
             )
         else:
             state, next_ids = self._commit_tracking_state_assignment_guided(
@@ -685,6 +1084,15 @@ class RFDETRModelModule(LightningModule):
         if tbptt_chunk_frames is not None and tbptt_chunk_frames < 1:
             raise ValueError(f"tbptt_chunk_frames ({tbptt_chunk_frames}) must be at least one frame")
 
+        # Reset the per-step lifecycle-commitment diagnostics (duplicate-FP PRD US-009) and the
+        # error-exposure diagnostics (US-010): only supervised frames of this clip contribute
+        # counts, so burn-in and prior clips leave nothing behind.
+        self._lifecycle_commit_frames = {"oracle": 0, "prediction_driven": 0}
+        self._lifecycle_transition_counts = Counter()
+        self._error_exposure_diagnostics = self._empty_error_exposure_diagnostics()
+        self._injected_track_records = {}
+        self._sampling_transition_diagnostics = self._empty_sampling_transition_diagnostics()
+
         batch_size = len(target_batches[0])
         slot_track_ids = [tuple(None for _ in range(self.model_config.num_queries)) for _ in range(batch_size)]
         needs_tables = inference_like or burn_in_frames > 0
@@ -731,7 +1139,12 @@ class RFDETRModelModule(LightningModule):
                 frame_index=frame_index,
                 inference_like=frame_inference_like,
                 fp_injection_remaining=injection_remaining,
+                record_diagnostics=record_loss,
+                frame_targets=list(targets),
             )
+            if record_loss:
+                stage = "prediction_driven" if frame_inference_like else "oracle"
+                self._lifecycle_commit_frames[stage] += batch_size
             frame_outputs.append((outputs, targets))
 
         # Burn-in: prediction-driven recurrence under no gradient (PRD Section 7.6). Never
@@ -748,15 +1161,34 @@ class RFDETRModelModule(LightningModule):
         # and, since the loop ends at the clip boundary, no gradient graph survives past the clip.
         supervised_indices = range(burn_in_frames, len(frame_batches))
         chunk_size = tbptt_chunk_frames if tbptt_chunk_frames is not None else max(1, len(supervised_indices))
+        supervised_injection_flags: list[bool] = []
+        supervised_dropout_flags: list[bool] = []
         for offset, frame_index in enumerate(supervised_indices):
+            fp_applied_before = self._error_exposure_diagnostics["fp_injection_applied"]
+            dropout_applied_before = self._error_exposure_diagnostics["query_dropout_applied"]
             _run_frame(
                 frame_index,
                 frame_inference_like=inference_like,
                 record_loss=compute_losses,
                 injection_remaining=fp_injection_remaining,
             )
+            supervised_injection_flags.append(
+                self._error_exposure_diagnostics["fp_injection_applied"] > fp_applied_before
+            )
+            supervised_dropout_flags.append(
+                self._error_exposure_diagnostics["query_dropout_applied"] > dropout_applied_before
+            )
             if (offset + 1) % chunk_size == 0:
-                state = TrackQueryState(state.query_features.detach(), state.reference_boxes.detach(), state.active_mask)
+                state = TrackQueryState(
+                    state.query_features.detach(), state.reference_boxes.detach(), state.active_mask
+                )
+
+        self._finalize_error_exposure_diagnostics()
+        self._accumulate_sampling_transition_composition(
+            supervised_targets=[target_batches[index] for index in supervised_indices],
+            injection_flags=supervised_injection_flags,
+            dropout_flags=supervised_dropout_flags,
+        )
 
         loss_names = set().union(*(losses.keys() for losses in frame_losses)) if frame_losses else set()
         mean_losses = {
@@ -764,18 +1196,131 @@ class RFDETRModelModule(LightningModule):
         }
         return mean_losses, frame_outputs
 
+    def _resolve_supervised_lifecycle_inference_like(self) -> bool:
+        """Resolve the assignment-guided -> prediction-driven curriculum for this training step.
+
+        Returns whether the *supervised* frames of this step's clip commit recurrent state
+        through the exact deployment lifecycle (:func:`transition_lifecycle`) rather than the
+        assignment-guided control. ``lifecycle_commitment_curriculum.mode == "disabled"``
+        defers entirely to the static ``lifecycle_mode`` so pre-existing runs are unchanged;
+        ``"epoch"`` / ``"step"`` switch from the control to prediction-driven commitment once
+        the configured warm-up has elapsed, deterministically from ``trainer.current_epoch`` /
+        ``trainer.global_step`` (so repeated runs and resumes agree). Burn-in frames always
+        run prediction-driven regardless of this result.
+        """
+        tracking_config = self.train_config.tracking
+        curriculum = tracking_config.lifecycle_commitment_curriculum
+        if curriculum.mode == "disabled":
+            return tracking_config.lifecycle_mode == "inference_like"
+        trainer = getattr(self, "_trainer", None)
+        if curriculum.mode == "epoch":
+            return int(getattr(trainer, "current_epoch", 0) or 0) >= curriculum.warmup_epochs
+        return int(getattr(trainer, "global_step", 0) or 0) >= curriculum.warmup_steps
+
+    def _log_lifecycle_commitment_diagnostics(self, *, batch_size: int) -> None:
+        """Log this step's oracle/prediction commitment fractions and every lifecycle event kind.
+
+        ``train/lifecycle_prediction_driven_fraction`` is the share of the step's supervised
+        frame-item commits that ran through the deployment lifecycle rather than the
+        assignment-guided control; ``on_epoch=True`` means the epoch-level value shows exactly
+        where the US-009 curriculum crossed over. ``train/lifecycle_event_<kind>`` reports the
+        per-step count of every prediction-driven :class:`LifecycleEvent` kind
+        (``activated``, ``suspended``, ``recovered``, ``terminated``, ``confirmed``,
+        ``tentative_started``, ...), so incorrect births and missed continuations produced by
+        the model's own state are visible during training.
+        """
+        commit_frames = self._lifecycle_commit_frames
+        total = commit_frames["oracle"] + commit_frames["prediction_driven"]
+        prediction_fraction = commit_frames["prediction_driven"] / total if total else 0.0
+        oracle_fraction = commit_frames["oracle"] / total if total else 0.0
+        log_kwargs = dict(
+            on_step=self.train_config.train_log_on_step,
+            on_epoch=True,
+            sync_dist=self.train_config.train_log_sync_dist,
+            batch_size=batch_size,
+        )
+        self.log("train/lifecycle_prediction_driven_fraction", prediction_fraction, **log_kwargs)
+        self.log("train/lifecycle_oracle_fraction", oracle_fraction, **log_kwargs)
+        for kind in _LIFECYCLE_EVENT_KINDS:
+            self.log(
+                f"train/lifecycle_event_{kind}",
+                float(self._lifecycle_transition_counts.get(kind, 0)),
+                **log_kwargs,
+            )
+
+    def _log_error_exposure_diagnostics(self, *, batch_size: int) -> None:
+        """Log this step's false-positive-injection and query-dropout diagnostics (US-010).
+
+        Covers every field the story's acceptance criteria call for: attempted vs. applied
+        counts for both mechanisms, the mean genuine foreground score that was overridden, the
+        mean ground-truth box overlap of the perturbed slots (``0`` when a slot overlaps no
+        real object), the mean active-capacity pressure at injection time, the mean lifetime of
+        injected tracks (frames survived within the clip), and how many injected tracks the
+        lifecycle later cancelled. ``train/error_exposure_curriculum_factor`` records the
+        warm-up-then-ramp multiplier currently applied to both sampling rates.
+        """
+        diagnostics = self._error_exposure_diagnostics
+        fp_applied = diagnostics["fp_injection_applied"]
+        fp_tracked = diagnostics["fp_injection_tracked"]
+        dropout_applied = diagnostics["query_dropout_applied"]
+
+        def _mean(total: float, count: float) -> float:
+            return total / count if count else 0.0
+
+        log_kwargs = dict(
+            on_step=self.train_config.train_log_on_step,
+            on_epoch=True,
+            sync_dist=self.train_config.train_log_sync_dist,
+            batch_size=batch_size,
+        )
+        values = {
+            "train/error_exposure_curriculum_factor": self._error_exposure_curriculum_factor(),
+            "train/error_exposure_fp_injection_attempted": diagnostics["fp_injection_attempted"],
+            "train/error_exposure_fp_injection_applied": fp_applied,
+            "train/error_exposure_fp_injection_cancelled": diagnostics["fp_injection_cancelled"],
+            "train/error_exposure_fp_injection_mean_score": _mean(diagnostics["fp_injection_score_sum"], fp_applied),
+            "train/error_exposure_fp_injection_mean_target_iou": _mean(
+                diagnostics["fp_injection_target_iou_sum"], fp_applied
+            ),
+            "train/error_exposure_fp_injection_mean_capacity_pressure": _mean(
+                diagnostics["fp_injection_capacity_pressure_sum"], fp_applied
+            ),
+            "train/error_exposure_fp_injection_mean_lifetime": _mean(
+                diagnostics["fp_injection_lifetime_sum"], fp_tracked
+            ),
+            "train/error_exposure_query_dropout_attempted": diagnostics["query_dropout_attempted"],
+            "train/error_exposure_query_dropout_applied": dropout_applied,
+            "train/error_exposure_query_dropout_mean_score": _mean(
+                diagnostics["query_dropout_score_sum"], dropout_applied
+            ),
+            "train/error_exposure_query_dropout_mean_target_iou": _mean(
+                diagnostics["query_dropout_target_iou_sum"], dropout_applied
+            ),
+            "train/error_exposure_query_dropout_mean_lifetime": _mean(
+                diagnostics["query_dropout_lifetime_sum"], dropout_applied
+            ),
+        }
+        for name, value in values.items():
+            self.log(name, float(value), **log_kwargs)
+
     def _training_step_tracking(
         self, frame_batches: tuple | list, target_batches: tuple | list, batch_idx: int
     ) -> torch.Tensor:
         """Run one causal video-training step with clip-local recurrent state."""
         tracking_config = self.train_config.tracking
+        cuda_device = self._tracking_clip_cuda_device(frame_batches)
+        if cuda_device is not None:
+            torch.cuda.reset_peak_memory_stats(cuda_device)
+        unroll_start = time.perf_counter()
         loss_dict, _ = self._unroll_tracking_clip(
             frame_batches,
             target_batches,
-            inference_like=tracking_config.lifecycle_mode == "inference_like",
+            inference_like=self._resolve_supervised_lifecycle_inference_like(),
             burn_in_frames=tracking_config.burn_in_frames,
             tbptt_chunk_frames=tracking_config.tbptt_chunk_frames,
         )
+        unroll_seconds = time.perf_counter() - unroll_start
+        peak_vram_bytes = int(torch.cuda.max_memory_allocated(cuda_device)) if cuda_device is not None else 0
         weight_dict = self.criterion.weight_dict
         loss = sum(loss_dict[name] * weight_dict[name] for name in loss_dict if name in weight_dict)
         batch_size = len(target_batches[0])
@@ -795,7 +1340,31 @@ class RFDETRModelModule(LightningModule):
             batch_size=batch_size,
         )
         self._log_train_progress_metrics(loss, loss_dict, batch_size=batch_size)
+        self._log_lifecycle_commitment_diagnostics(batch_size=batch_size)
+        self._log_error_exposure_diagnostics(batch_size=batch_size)
+        self._log_sampling_transition_diagnostics(batch_size=batch_size)
+        self._log_tracking_step_perf_metrics(
+            unroll_seconds=unroll_seconds,
+            peak_vram_bytes=peak_vram_bytes,
+            processed_frames=batch_size * tracking_config.clip_length,
+            gradient_bearing_frames=batch_size * tracking_config.supervised_frames,
+            batch_size=batch_size,
+        )
         return loss / max(1, int(self.trainer.accumulate_grad_batches))
+
+    @staticmethod
+    def _tracking_clip_cuda_device(frame_batches: tuple | list) -> torch.device | None:
+        """Return the CUDA device a tracking clip lives on, or ``None`` when it is not on CUDA.
+
+        Peak-VRAM accounting (duplicate-FP PRD US-011 AC) is only meaningful on CUDA; on CPU (the
+        unit-test path) this returns ``None`` and the caller reports ``0`` bytes rather than
+        calling ``torch.cuda`` APIs that would raise.
+        """
+        if not torch.cuda.is_available() or not frame_batches:
+            return None
+        tensors = getattr(frame_batches[0], "tensors", None)
+        device = getattr(tensors, "device", None)
+        return device if device is not None and device.type == "cuda" else None
 
     def _compute_train_losses(
         self,

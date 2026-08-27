@@ -218,6 +218,14 @@ class TrackingSessionConfig(BaseConfig):
             beginning at the first hit, in which confirmation must occur.
         tentative_max_misses: Misses tolerated while tentative; reaching this
             count cancels the tentative track.
+        tentative_association_iou_threshold: Minimum IoU between a tentative
+            candidate's last observed box and a fresh inactive-slot discovery
+            for that discovery to be eligible to confirm it (PRD Section
+            5.1). Association is otherwise class-aware and globally
+            one-to-one across every pending tentative and eligible
+            discovery in one frame; an edge below this gate can never
+            increment a tentative's hit count, regardless of how few
+            competing candidates exist.
         max_discovery_candidates_per_frame: Highest-scoring foreground
             discoveries considered for birth in one frame. The limit is
             deliberately independent of the decoder query count so that
@@ -278,6 +286,26 @@ class TrackingSessionConfig(BaseConfig):
             when ``identity_memory_enabled`` is ``False``.
         collect_timing: Collect synchronized per-frame latency measurements.
             Disabled by default to avoid adding measurement overhead.
+        collision_iou_threshold: IoU above which two same-class ``"active"``
+            slots are treated as a duplicate-collision pair requiring
+            arbitration (PRD Section 5.2), evaluated after this frame's
+            continuation, confirmation, and birth stages have all committed.
+            The loser's observation is excluded from emission for this frame
+            regardless of ``collision_persistence_frames``.
+        collision_persistence_frames: Consecutive frames a slot must lose
+            duplicate-collision arbitration before ``collision_loser_outcome``
+            is applied to its recurrent state. Below this count the loser's
+            own lifecycle state is left completely untouched -- only its
+            emitted observation for that frame is suppressed -- so a single
+            transient crossing between two genuine objects never merges or
+            terminates either identity.
+        collision_loser_outcome: Recurrent-state disposition applied to a
+            duplicate-collision loser once ``collision_persistence_frames``
+            is reached. ``"remains_active"`` keeps suppressing its emission
+            every colliding frame without changing its status.
+            ``"suspended"`` demotes it exactly like a normal suspension.
+            ``"terminated"`` recycles its slot exactly like a normal
+            termination.
     """
 
     activation_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
@@ -287,8 +315,12 @@ class TrackingSessionConfig(BaseConfig):
     tentative_confirmation_hits: int = Field(default=2, ge=1)
     tentative_confirmation_window_frames: int = Field(default=3, ge=1)
     tentative_max_misses: int = Field(default=2, ge=1)
+    tentative_association_iou_threshold: float = Field(default=0.3, ge=0.0, le=1.0)
     max_discovery_candidates_per_frame: int = Field(default=10, ge=1)
     max_tentative_tracks: int = Field(default=10, ge=1)
+    collision_iou_threshold: float = Field(default=0.7, ge=0.0, le=1.0)
+    collision_persistence_frames: int = Field(default=3, ge=1)
+    collision_loser_outcome: Literal["remains_active", "suspended", "terminated"] = "suspended"
     reassociation_enabled: bool = False
     reassociation_iou_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
     motion_reference_prediction_enabled: bool = False
@@ -302,6 +334,102 @@ class TrackingSessionConfig(BaseConfig):
         if self.tentative_confirmation_hits > self.tentative_confirmation_window_frames:
             raise ValueError("tentative confirmation hits cannot exceed the confirmation window")
         return self
+
+
+class LifecycleCommitmentCurriculumConfig(BaseConfig):
+    """Deterministic assignment-guided -> prediction-driven commitment schedule.
+
+    Implements the duplicate-FP PRD US-009 curriculum: for a configurable
+    warm-up the supervised training frames commit recurrent state through the
+    assignment-guided control
+    (``RFDETRModelModule._commit_tracking_state_assignment_guided``); once the
+    warm-up has elapsed they commit through the exact deployment lifecycle
+    (:func:`rfdetr.tracking.lifecycle.transition_lifecycle`), so the recurrent
+    network learns from the false births, missed continuations, suspensions,
+    and terminations it produces itself.
+
+    ``mode="disabled"`` keeps :attr:`TrackingTrainConfig.lifecycle_mode` in
+    force for the entire run, so every pre-existing assignment-guided and
+    inference-like configuration is byte-for-byte unchanged. The schedule is a
+    pure function of ``trainer.current_epoch`` / ``trainer.global_step`` and
+    therefore identical across repeated runs and resumes.
+
+    Attributes:
+        mode: ``"disabled"`` always uses the static ``lifecycle_mode``.
+            ``"epoch"`` uses the assignment-guided control until
+            ``warmup_epochs`` completed epochs have elapsed, then switches to
+            prediction-driven commitment. ``"step"`` switches once
+            ``warmup_steps`` global optimizer steps have elapsed.
+        warmup_epochs: Completed assignment-guided training epochs before
+            prediction-driven commitment begins. Used only when
+            ``mode == "epoch"``. Zero starts prediction-driven from epoch 0.
+        warmup_steps: Global optimizer steps of assignment-guided warm-up
+            before prediction-driven commitment begins. Used only when
+            ``mode == "step"``. Zero starts prediction-driven from step 0.
+    """
+
+    mode: Literal["disabled", "epoch", "step"] = "disabled"
+    warmup_epochs: int = Field(default=0, ge=0)
+    warmup_steps: int = Field(default=0, ge=0)
+
+
+class ErrorExposureCurriculumConfig(BaseConfig):
+    """Deterministic epoch/step schedule for the error-exposure sampling rates.
+
+    Implements the duplicate-FP PRD US-010 curriculum: the configured
+    ``false_positive_injection_probability`` and ``query_dropout_probability``
+    are both multiplied by a factor in ``[0.0, 1.0]`` computed purely from
+    ``trainer.current_epoch`` / ``trainer.global_step`` -- ``0.0`` for the
+    warm-up, then a linear ramp to ``1.0`` over the ramp window, then a
+    sustained ``1.0``. The schedule is therefore identical across repeated runs
+    and resumes.
+
+    ``mode="disabled"`` (the default) keeps both probabilities at their
+    configured value for the entire run, so every pre-existing error-exposure
+    configuration is byte-for-byte unchanged. Independently, setting either
+    probability to ``0.0`` is an exact zero-valued control regardless of this
+    schedule (``0.0 * factor == 0.0``).
+
+    Attributes:
+        mode: ``"disabled"`` always applies the configured probabilities.
+            ``"epoch"`` schedules on completed epochs; ``"step"`` on global
+            optimizer steps.
+        warmup_epochs: Completed epochs held at an injection/dropout factor of
+            ``0.0``. Used only when ``mode == "epoch"``.
+        ramp_epochs: Epochs over which the factor ramps linearly from ``0.0``
+            to ``1.0`` once the warm-up has elapsed. Zero steps straight to
+            ``1.0``. Used only when ``mode == "epoch"``.
+        warmup_steps: Global optimizer steps held at a factor of ``0.0``. Used
+            only when ``mode == "step"``.
+        ramp_steps: Global optimizer steps over which the factor ramps
+            linearly from ``0.0`` to ``1.0`` once the warm-up has elapsed.
+            Zero steps straight to ``1.0``. Used only when ``mode == "step"``.
+    """
+
+    mode: Literal["disabled", "epoch", "step"] = "disabled"
+    warmup_epochs: int = Field(default=0, ge=0)
+    ramp_epochs: int = Field(default=0, ge=0)
+    warmup_steps: int = Field(default=0, ge=0)
+    ramp_steps: int = Field(default=0, ge=0)
+
+    def factor_at(self, *, epoch: int, step: int) -> float:
+        """Return the injection/dropout probability multiplier for a schedule position.
+
+        Args:
+            epoch: Completed training epochs (``trainer.current_epoch``).
+            step: Global optimizer steps (``trainer.global_step``).
+        """
+        if self.mode == "disabled":
+            return 1.0
+        if self.mode == "epoch":
+            progress, ramp = epoch - self.warmup_epochs, self.ramp_epochs
+        else:
+            progress, ramp = step - self.warmup_steps, self.ramp_steps
+        if progress < 0:
+            return 0.0
+        if ramp <= 0:
+            return 1.0
+        return min(1.0, progress / ramp)
 
 
 class TrackingTrainConfig(BaseConfig):
@@ -343,6 +471,12 @@ class TrackingTrainConfig(BaseConfig):
             than ground-truth-repaired state; ground truth is still used to
             build the loss via ``identity_aware_sequence_assignment``, but it
             never overrides the committed lifecycle state.
+        lifecycle_commitment_curriculum: Deterministic epoch/step schedule that
+            switches supervised-frame state commitment from the
+            assignment-guided control to the prediction-driven deployment
+            lifecycle after a configurable warm-up (duplicate-FP PRD US-009).
+            ``mode="disabled"`` (the default) keeps ``lifecycle_mode`` in force
+            for the whole run.
         lifecycle: Lifecycle thresholds and capacities applied while
             committing state in ``"inference_like"`` mode. Ignored in
             ``"assignment_guided"`` mode.
@@ -373,6 +507,11 @@ class TrackingTrainConfig(BaseConfig):
         error_exposure_seed: Seed for the deterministic generator that drives
             false-positive injection and query dropout sampling, independent
             of any other training randomness.
+        error_exposure_curriculum: Deterministic epoch/step schedule that
+            scales ``false_positive_injection_probability`` and
+            ``query_dropout_probability`` by a warm-up-then-ramp factor
+            (duplicate-FP PRD US-010). ``mode="disabled"`` (the default) keeps
+            both probabilities at their configured value for the whole run.
     """
 
     clip_length: int = Field(default=1, ge=1)
@@ -383,6 +522,9 @@ class TrackingTrainConfig(BaseConfig):
     supervised_frames: int = Field(default=1, ge=1)
     tbptt_chunk_frames: int | None = Field(default=None, ge=1)
     lifecycle_mode: Literal["assignment_guided", "inference_like"] = "assignment_guided"
+    lifecycle_commitment_curriculum: LifecycleCommitmentCurriculumConfig = Field(
+        default_factory=LifecycleCommitmentCurriculumConfig
+    )
     lifecycle: TrackingSessionConfig = Field(default_factory=TrackingSessionConfig)
     tracking_eval_interval_epochs: int = Field(default=5, ge=1)
     false_positive_injection_enabled: bool = False
@@ -391,6 +533,7 @@ class TrackingTrainConfig(BaseConfig):
     query_dropout_enabled: bool = False
     query_dropout_probability: float = Field(default=0.10, ge=0.0, le=1.0)
     error_exposure_seed: int = Field(default=0, ge=0)
+    error_exposure_curriculum: ErrorExposureCurriculumConfig = Field(default_factory=ErrorExposureCurriculumConfig)
 
     @field_validator("annotation_path", mode="before")
     @classmethod

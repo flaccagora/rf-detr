@@ -1351,9 +1351,7 @@ class TestPredictionDrivenLifecyclePropagation:
             max_missed_frames=1,
             **lifecycle_overrides,
         )
-        tc = _base_train_config(
-            tmp_path, tracking={"lifecycle_mode": "inference_like", "lifecycle": lifecycle}
-        )
+        tc = _base_train_config(tmp_path, tracking={"lifecycle_mode": "inference_like", "lifecycle": lifecycle})
         module, *_ = _build_module(model_config=mc, train_config=tc, tmp_path=tmp_path)
         return module, mc
 
@@ -1628,7 +1626,9 @@ class TestBurnInAndTruncatedBackprop:
         """Loss normalization must be invariant to how long the burn-in prefix is: two clips with the
         same two supervised-frame losses but different burn-in prefix lengths (0 vs. 3, for total
         clip lengths of 2 and 5) must produce the identical mean loss."""
-        no_burn_in_module, _, no_burn_in_criterion = self._module_with_causal_model(tmp_path / "no-burn-in", clip_length=2)
+        no_burn_in_module, _, no_burn_in_criterion = self._module_with_causal_model(
+            tmp_path / "no-burn-in", clip_length=2
+        )
         no_burn_in_criterion.side_effect = [
             {"loss_ce": torch.tensor(2.0, requires_grad=True)},
             {"loss_ce": torch.tensor(4.0, requires_grad=True)},
@@ -1784,10 +1784,8 @@ class TestErrorExposurePilots:
             logits[0, query, 0] = 10.0
         index = torch.arange(mc.num_queries, dtype=torch.float32)
         cx = 0.05 + 0.01 * (index % 40)
-        boxes = torch.stack(
-            [cx, torch.full((mc.num_queries,), 0.5), torch.full((mc.num_queries,), 0.005), torch.full((mc.num_queries,), 0.005)],
-            dim=-1,
-        ).unsqueeze(0)
+        wh = torch.full((mc.num_queries,), 0.005)
+        boxes = torch.stack([cx, torch.full((mc.num_queries,), 0.5), wh, wh], dim=-1).unsqueeze(0)
         candidate_state = TrackQueryState(
             torch.full((1, mc.num_queries, mc.hidden_dim), feature_value),
             boxes,
@@ -1905,7 +1903,15 @@ class TestErrorExposurePilots:
         module, mc = self._module(tmp_path)
         slots = list(TrackSlotTable.empty(mc.num_queries).slots)
         slots[0] = replace(
-            slots[0], track_id=1, status="active", age=1, hits=1, missed_frames=0, last_reliable_frame=0, confidence=0.9, class_id=0
+            slots[0],
+            track_id=1,
+            status="active",
+            age=1,
+            hits=1,
+            missed_frames=0,
+            last_reliable_frame=0,
+            confidence=0.9,
+            class_id=0,
         )
         table = TrackSlotTable(slots=tuple(slots), next_track_id=2)
 
@@ -1985,6 +1991,652 @@ class TestErrorExposurePilots:
 
         statuses = {tables[0].slots[0].status, tables[0].slots[1].status}
         assert statuses == {"active", "suspended"}
+
+
+class TestErrorExposureCurriculumAndDiagnostics:
+    """Duplicate-FP PRD US-010: error-exposure sampling is deterministic per (run seed, frame,
+    batch item, query index), supports an exact zero-valued control and a documented
+    warm-up/ramp curriculum, is logged with attempted/applied/quality diagnostics, and can
+    never smuggle a real identity into an injected false-positive query."""
+
+    class _WeakModel(nn.Module):
+        """Emits a uniform weak score on every query -- nothing is ever born organically -- while
+        carrying the prior active mask forward, so every birth is attributable to injection."""
+
+        def __init__(self, mc) -> None:
+            super().__init__()
+            self.mc = mc
+            self.weight = nn.Parameter(torch.ones(1))
+
+        def forward_tracking(self, samples, prior_state=None):
+            num_queries = self.mc.num_queries
+            logits = torch.full((1, num_queries, self.mc.num_classes + 1), -10.0)
+            index = torch.arange(num_queries, dtype=torch.float32)
+            cx = 0.02 + 0.005 * (index % 50)
+            wh = torch.full((num_queries,), 0.01)
+            boxes = torch.stack([cx, torch.full((num_queries,), 0.5), wh, wh], dim=-1).unsqueeze(0) * self.weight
+            if prior_state is None:
+                active_mask = torch.zeros((1, num_queries), dtype=torch.bool)
+            else:
+                active_mask = prior_state.active_mask
+            features = self.weight.expand(1, num_queries, self.mc.hidden_dim)
+            return TrackingFrameOutput(
+                pred_logits=logits,
+                pred_boxes=boxes,
+                candidate_state=TrackQueryState(features, boxes, torch.ones_like(active_mask)),
+                input_active_mask=active_mask,
+            )
+
+    @staticmethod
+    def _strong_frame(mc, prior_state, discovery_queries):
+        """A frame whose only strong foreground scores are ``discovery_queries`` (distinct boxes)."""
+        logits = torch.full((1, mc.num_queries, mc.num_classes + 1), -10.0)
+        for query in discovery_queries:
+            logits[0, query, 0] = 10.0
+        index = torch.arange(mc.num_queries, dtype=torch.float32)
+        cx = 0.05 + 0.01 * (index % 40)
+        wh = torch.full((mc.num_queries,), 0.005)
+        boxes = torch.stack([cx, torch.full((mc.num_queries,), 0.5), wh, wh], dim=-1).unsqueeze(0)
+        return TrackingFrameOutput(
+            pred_logits=logits,
+            pred_boxes=boxes,
+            candidate_state=TrackQueryState(
+                torch.ones(1, mc.num_queries, mc.hidden_dim), boxes, torch.ones(1, mc.num_queries, dtype=torch.bool)
+            ),
+            input_active_mask=prior_state.active_mask.clone(),
+        )
+
+    def _module(self, tmp_path, **tracking_overrides):
+        mc = _base_model_config(tracking={"enabled": True}, group_detr=1)
+        lifecycle = TrackingSessionConfig(
+            activation_threshold=0.5,
+            continuation_threshold=0.3,
+            tentative_confirmation_hits=1,
+            tentative_confirmation_window_frames=1,
+            tentative_max_misses=1,
+            max_missed_frames=5,
+        )
+        overrides = dict(lifecycle_mode="inference_like", lifecycle=lifecycle, clip_length=3)
+        overrides.update(tracking_overrides)
+        tc = _base_train_config(tmp_path, tracking=overrides)
+        module, _, criterion, _ = _build_module(model_config=mc, train_config=tc, tmp_path=tmp_path)
+        module.model = self._WeakModel(mc)
+        criterion.weight_dict = {"loss_ce": 1.0}
+        return module, mc, criterion
+
+    def _empty_target_batches(self, num_frames, *, track_id=None):
+        box = torch.tensor([[0.05, 0.5, 0.02, 0.02]])
+        labels = torch.zeros((1,), dtype=torch.int64)
+        track_ids = torch.tensor([track_id if track_id is not None else -1], dtype=torch.int64)
+        return tuple(
+            (
+                {
+                    "boxes": box.clone(),
+                    "labels": labels.clone(),
+                    "track_ids": track_ids.clone(),
+                    "orig_size": torch.tensor([16, 16]),
+                },
+            )
+            for _ in range(num_frames)
+        )
+
+    def test_draw_is_stable_per_query_index_regardless_of_other_eligible_slots(self, tmp_path):
+        """A query index's draw is identical whether it is the only eligible slot or one of
+        many -- the seed is per (seed, salt, frame, batch item, query index), never a shared
+        per-frame vector whose alignment shifts when eligibility changes."""
+        module, *_ = self._module(tmp_path, error_exposure_seed=11)
+        alone = module._error_exposure_draws(salt=1, frame_index=4, batch_index=2, query_indices=[7])
+        crowded = module._error_exposure_draws(salt=1, frame_index=4, batch_index=2, query_indices=[0, 3, 7, 9])
+        assert alone[0] == crowded[2]
+
+    def test_draw_depends_on_seed_salt_frame_batch_and_query_index(self, tmp_path):
+        """Changing any one of run seed, mechanism salt, frame, batch item, or query index
+        changes the draw, so the two mechanisms and every coordinate are independently keyed."""
+        module, *_ = self._module(tmp_path / "a", error_exposure_seed=3)
+        base = module._error_exposure_draws(salt=1, frame_index=0, batch_index=0, query_indices=[0])[0]
+        assert module._error_exposure_draws(salt=1, frame_index=1, batch_index=0, query_indices=[0])[0] != base
+        assert module._error_exposure_draws(salt=1, frame_index=0, batch_index=1, query_indices=[0])[0] != base
+        assert module._error_exposure_draws(salt=1, frame_index=0, batch_index=0, query_indices=[1])[0] != base
+        assert module._error_exposure_draws(salt=2, frame_index=0, batch_index=0, query_indices=[0])[0] != base
+        other_seed, *_ = self._module(tmp_path / "b", error_exposure_seed=99)
+        assert other_seed._error_exposure_draws(salt=1, frame_index=0, batch_index=0, query_indices=[0])[0] != base
+
+    def test_curriculum_warmup_holds_sampling_at_zero_then_full_after_ramp(self, tmp_path):
+        """The documented curriculum scales both probabilities by a factor that is 0 during the
+        warm-up and 1 once the (here zero-length) ramp completes."""
+        module, *_ = self._module(
+            tmp_path,
+            error_exposure_curriculum={"mode": "epoch", "warmup_epochs": 2, "ramp_epochs": 0},
+        )
+        module._trainer = SimpleNamespace(current_epoch=1, global_step=0)
+        assert module._error_exposure_curriculum_factor() == 0.0
+        module._trainer = SimpleNamespace(current_epoch=2, global_step=0)
+        assert module._error_exposure_curriculum_factor() == 1.0
+
+    def test_zero_probability_is_an_exact_control_even_at_full_curriculum_factor(self, tmp_path):
+        """A configured probability of 0.0 injects/drops nothing regardless of the curriculum
+        factor -- ``0.0 * 1.0 == 0.0`` -- so it is an exact zero-valued control."""
+        module, mc, _ = self._module(
+            tmp_path,
+            false_positive_injection_enabled=True,
+            false_positive_injection_probability=0.0,
+            error_exposure_curriculum={"mode": "epoch", "warmup_epochs": 0, "ramp_epochs": 0},
+        )
+        module._trainer = SimpleNamespace(current_epoch=50, global_step=999)
+        assert module._error_exposure_curriculum_factor() == 1.0
+        configured = module.train_config.tracking.false_positive_injection_probability
+        effective = configured * module._error_exposure_curriculum_factor()
+        _eligible, attempted, selected = module._false_positive_injection_plan(
+            TrackSlotTable.empty(mc.num_queries),
+            _empty_assignment(mc.num_queries),
+            frame_index=0,
+            batch_index=0,
+            probability=effective,
+            max_count=mc.num_queries,
+        )
+        assert attempted == []
+        assert selected == []
+
+    def _run_training_step(self, module, criterion, target_batches):
+        num_frames = len(target_batches)
+        frame_batches = tuple(_make_batch(batch_size=1)[0] for _ in range(num_frames))
+        criterion.side_effect = [{"loss_ce": torch.tensor(1.0, requires_grad=True)} for _ in range(num_frames)]
+        criterion.matcher = lambda outputs, targets: [
+            (torch.empty(0, dtype=torch.long), torch.empty(0, dtype=torch.long))
+        ]
+        module.log = MagicMock()
+        module.log_dict = MagicMock()
+        module._trainer = SimpleNamespace(accumulate_grad_batches=1, current_epoch=0, global_step=0)
+        type(module).trainer = property(lambda self: self._trainer)
+        try:
+            module.training_step((frame_batches, target_batches), batch_idx=0)
+        finally:
+            del type(module).trainer
+        return {call.args[0]: call.args[1] for call in module.log.call_args_list if call.args}
+
+    def test_training_step_logs_error_exposure_attempted_applied_and_quality_metrics(self, tmp_path):
+        """A step with both mechanisms at probability 1.0 produces non-zero false-persistent and
+        dropped-genuine transitions and logs every acceptance-criteria diagnostic: attempted /
+        applied counts, mean overridden score, mean ground-truth overlap, mean capacity
+        pressure, mean injected-track lifetime, and injected-track cancellations."""
+        module, _mc, criterion = self._module(
+            tmp_path,
+            clip_length=3,
+            false_positive_injection_enabled=True,
+            false_positive_injection_probability=1.0,
+            false_positive_injection_max_per_sample=2,
+            query_dropout_enabled=True,
+            query_dropout_probability=1.0,
+        )
+        logged = self._run_training_step(module, criterion, self._empty_target_batches(3, track_id=777))
+
+        for key in (
+            "train/error_exposure_curriculum_factor",
+            "train/error_exposure_fp_injection_attempted",
+            "train/error_exposure_fp_injection_applied",
+            "train/error_exposure_fp_injection_cancelled",
+            "train/error_exposure_fp_injection_mean_score",
+            "train/error_exposure_fp_injection_mean_target_iou",
+            "train/error_exposure_fp_injection_mean_capacity_pressure",
+            "train/error_exposure_fp_injection_mean_lifetime",
+            "train/error_exposure_query_dropout_attempted",
+            "train/error_exposure_query_dropout_applied",
+            "train/error_exposure_query_dropout_mean_score",
+            "train/error_exposure_query_dropout_mean_target_iou",
+            "train/error_exposure_query_dropout_mean_lifetime",
+        ):
+            assert key in logged, key
+        assert logged["train/error_exposure_curriculum_factor"] == pytest.approx(1.0)
+        assert logged["train/error_exposure_fp_injection_applied"] >= 1.0
+        assert logged["train/error_exposure_fp_injection_mean_lifetime"] >= 1.0
+        assert logged["train/error_exposure_query_dropout_applied"] >= 1.0
+
+    def test_injected_query_is_supervised_as_no_object_and_never_gains_a_real_identity(self, tmp_path):
+        """With ground truth present but the discovery matcher matching nothing, an injected
+        false-positive slot is born with a fresh lifecycle id; on the next frame its identity is
+        neither a ground-truth track id nor a matched decoder query -- it is supervised as
+        no-object, exactly as the acceptance criteria require."""
+        module, _mc, criterion = self._module(
+            tmp_path,
+            clip_length=2,
+            false_positive_injection_enabled=True,
+            false_positive_injection_probability=1.0,
+            false_positive_injection_max_per_sample=1,
+        )
+        gt_track_id = 555
+        target_batches = self._empty_target_batches(2, track_id=gt_track_id)
+        captured: list = []
+        criterion.side_effect = lambda outputs, targets, assignments: (
+            captured.append(assignments) or {"loss_ce": torch.tensor(1.0, requires_grad=True)}
+        )
+        criterion.matcher = lambda outputs, targets: [
+            (torch.empty(0, dtype=torch.long), torch.empty(0, dtype=torch.long))
+        ]
+        module._trainer = SimpleNamespace(current_epoch=0, global_step=0)
+        type(module).trainer = property(lambda self: self._trainer)
+        try:
+            module._unroll_tracking_clip(
+                tuple(_make_batch(batch_size=1)[0] for _ in range(2)), target_batches, inference_like=True
+            )
+        finally:
+            del type(module).trainer
+
+        frame1_assignment = captured[1][0]
+        absent = frame1_assignment.absent_query_indices.tolist()
+        assert absent, "the injected false-positive slot must be supervised as no-object"
+        matched_queries = set(frame1_assignment.decoder_indices[0].tolist())
+        assert not (set(absent) & matched_queries)
+        for query_index in absent:
+            assert frame1_assignment.slot_track_ids[query_index] != gt_track_id
+
+    def test_query_dropout_leaves_target_identity_bookkeeping_intact(self, tmp_path):
+        """Dropout suspends one of two genuine active slots without deleting either identity
+        from the slot table or mutating the frame's ground-truth ``track_ids``."""
+        module, mc, _ = self._module(tmp_path)
+        prior_state = TrackQueryState.empty(1, mc.num_queries, mc.hidden_dim)
+        tables = [TrackSlotTable.empty(mc.num_queries)]
+        no_assignment = [_empty_assignment(mc.num_queries)]
+
+        frame0 = self._strong_frame(mc, prior_state, (0, 1))
+        state, ids0, tables = module._commit_tracking_state_inference_like(
+            frame0, no_assignment, prior_state, tables, frame_index=0
+        )
+        born_ids = {track_id for track_id in ids0[0] if track_id is not None}
+        assert len(born_ids) == 2
+
+        module.train_config.tracking.query_dropout_enabled = True
+        module.train_config.tracking.query_dropout_probability = 1.0
+        frame_targets = [
+            {
+                "boxes": torch.tensor([[0.05, 0.5, 0.02, 0.02]]),
+                "labels": torch.zeros((1,), dtype=torch.int64),
+                "track_ids": torch.tensor([9], dtype=torch.int64),
+            }
+        ]
+        original_track_ids = frame_targets[0]["track_ids"].clone()
+        frame1 = self._strong_frame(mc, state, (0, 1))
+        state, ids1, tables = module._commit_tracking_state_inference_like(
+            frame1, no_assignment, state, tables, frame_index=1, frame_targets=frame_targets
+        )
+
+        assert torch.equal(frame_targets[0]["track_ids"], original_track_ids)
+        assert {track_id for track_id in tables[0].slot_track_ids if track_id is not None} == born_ids
+        assert {tables[0].slots[0].status, tables[0].slots[1].status} == {"active", "suspended"}
+
+
+class TestSamplingTransitionCompositionAndPerfMetrics:
+    """Duplicate-FP PRD US-011: a longer-horizon clip reports which supervised persistent
+    transitions it actually exercised (departure / re-entry / partial visibility / injected FP /
+    query dropout) and the per-step throughput, step time, peak VRAM, processed-frame, and
+    gradient-bearing-frame budget."""
+
+    class _CausalModel(nn.Module):
+        """Tiny trainable tracking model: every frame's boxes/features route through one shared
+        parameter, so a finite backward gradient proves a real (non-mocked) autograd path."""
+
+        def __init__(self, mc) -> None:
+            super().__init__()
+            self.mc = mc
+            self.weight = nn.Parameter(torch.ones(1))
+
+        def forward_tracking(self, samples, prior_state=None):
+            value = 1.0
+            features = (self.weight * value).expand(1, self.mc.num_queries, self.mc.hidden_dim)
+            boxes = torch.full((1, self.mc.num_queries, 4), 0.5) * self.weight
+            active_mask = (
+                torch.zeros((1, self.mc.num_queries), dtype=torch.bool)
+                if prior_state is None
+                else prior_state.active_mask
+            )
+            return TrackingFrameOutput(
+                pred_logits=torch.zeros((1, self.mc.num_queries, self.mc.num_classes + 1)),
+                pred_boxes=boxes,
+                candidate_state=TrackQueryState(features, boxes, torch.ones_like(active_mask)),
+                input_active_mask=active_mask,
+            )
+
+    def _module(self, tmp_path, *, fake_model=True, **tracking_overrides):
+        mc = _base_model_config(tracking={"enabled": True}, group_detr=1)
+        overrides = dict(clip_length=4)
+        overrides.update(tracking_overrides)
+        tc = _base_train_config(tmp_path, tracking=overrides)
+        module, _, criterion, _ = _build_module(model_config=mc, train_config=tc, tmp_path=tmp_path)
+        if fake_model:
+            module.model = self._CausalModel(mc)
+        criterion.matcher = MagicMock(return_value=[(torch.tensor([0]), torch.tensor([0]))])
+        criterion.weight_dict = {"loss_ce": 1.0}
+        return module, mc, criterion
+
+    @staticmethod
+    def _target(track_ids, boxes):
+        return {
+            "boxes": torch.tensor(boxes, dtype=torch.float32).reshape(-1, 4),
+            "labels": torch.zeros(len(track_ids), dtype=torch.int64),
+            "track_ids": list(track_ids),
+        }
+
+    def test_departure_transition_is_counted_when_a_track_disappears(self, tmp_path):
+        module, *_ = self._module(tmp_path)
+        supervised = [
+            [self._target([7], [[0.5, 0.5, 0.2, 0.2]])],
+            [self._target([], [])],
+        ]
+        module._accumulate_sampling_transition_composition(
+            supervised_targets=supervised, injection_flags=[False, False], dropout_flags=[False, False]
+        )
+        diagnostics = module._sampling_transition_diagnostics
+        assert diagnostics["supervised_transition_steps"] == 1.0
+        assert diagnostics["departure_steps"] == 1.0
+        assert diagnostics["re_entry_steps"] == 0.0
+
+    def test_re_entry_transition_requires_the_identity_to_have_been_seen_earlier(self, tmp_path):
+        module, *_ = self._module(tmp_path)
+        supervised = [
+            [self._target([7], [[0.5, 0.5, 0.2, 0.2]])],
+            [self._target([], [])],
+            [self._target([7], [[0.5, 0.5, 0.2, 0.2]])],
+        ]
+        module._accumulate_sampling_transition_composition(
+            supervised_targets=supervised, injection_flags=[False, False, False], dropout_flags=[False, False, False]
+        )
+        diagnostics = module._sampling_transition_diagnostics
+        assert diagnostics["supervised_transition_steps"] == 2.0
+        assert diagnostics["departure_steps"] == 1.0
+        assert diagnostics["re_entry_steps"] == 1.0
+
+    def test_partial_visibility_transition_is_a_shrink_below_half_the_earlier_peak_area(self, tmp_path):
+        module, *_ = self._module(tmp_path)
+        supervised = [
+            [self._target([7], [[0.5, 0.5, 0.2, 0.2]])],  # area 0.04
+            [self._target([7], [[0.5, 0.5, 0.1, 0.1]])],  # area 0.01 < 0.5 * 0.04
+        ]
+        module._accumulate_sampling_transition_composition(
+            supervised_targets=supervised, injection_flags=[False, False], dropout_flags=[False, False]
+        )
+        assert module._sampling_transition_diagnostics["partial_visibility_steps"] == 1.0
+
+    def test_injected_fp_and_query_dropout_flags_are_counted_per_supervised_step(self, tmp_path):
+        module, *_ = self._module(tmp_path)
+        supervised = [
+            [self._target([7], [[0.5, 0.5, 0.2, 0.2]])],
+            [self._target([7], [[0.5, 0.5, 0.2, 0.2]])],
+            [self._target([7], [[0.5, 0.5, 0.2, 0.2]])],
+        ]
+        module._accumulate_sampling_transition_composition(
+            supervised_targets=supervised,
+            injection_flags=[False, True, False],
+            dropout_flags=[False, False, True],
+        )
+        diagnostics = module._sampling_transition_diagnostics
+        assert diagnostics["injected_fp_steps"] == 1.0
+        assert diagnostics["query_dropout_steps"] == 1.0
+        # The first supervised frame carries no transition, so a flag there is never counted.
+        assert diagnostics["departure_steps"] == 0.0
+
+    def test_training_step_logs_perf_budget_and_sampling_fractions(self, tmp_path):
+        module, _mc, criterion = self._module(tmp_path, clip_length=4, burn_in_frames=1, supervised_frames=3)
+        num_frames = 4
+        frame_batches = tuple(_make_batch(batch_size=1)[0] for _ in range(num_frames))
+        target_batches = tuple((self._target([7], [[0.5, 0.5, 0.2, 0.2]]),) for _ in range(num_frames))
+        criterion.side_effect = [{"loss_ce": torch.tensor(1.0, requires_grad=True)} for _ in range(num_frames)]
+        criterion.matcher = lambda outputs, targets: [
+            (torch.empty(0, dtype=torch.long), torch.empty(0, dtype=torch.long))
+        ]
+        module.log = MagicMock()
+        module.log_dict = MagicMock()
+        module._trainer = SimpleNamespace(accumulate_grad_batches=1, current_epoch=0, global_step=0)
+        type(module).trainer = property(lambda self: self._trainer)
+        try:
+            module.training_step((frame_batches, target_batches), batch_idx=0)
+        finally:
+            del type(module).trainer
+        logged = {call.args[0]: call.args[1] for call in module.log.call_args_list if call.args}
+
+        for key in (
+            "train/perf_step_time_seconds",
+            "train/perf_processed_frames",
+            "train/perf_gradient_bearing_frames",
+            "train/perf_throughput_frames_per_second",
+            "train/perf_peak_vram_bytes",
+            "train/sampling_transition_supervised_steps",
+            "train/sampling_transition_departure_fraction",
+            "train/sampling_transition_injected_fp_fraction",
+        ):
+            assert key in logged, key
+        assert logged["train/perf_processed_frames"] == pytest.approx(4.0)  # batch 1 * clip_length 4
+        assert logged["train/perf_gradient_bearing_frames"] == pytest.approx(3.0)  # supervised_frames 3
+        assert logged["train/perf_peak_vram_bytes"] == pytest.approx(0.0)  # CPU test path
+        assert logged["train/perf_step_time_seconds"] >= 0.0
+        assert logged["train/sampling_transition_supervised_steps"] == pytest.approx(2.0)  # 3 supervised, 2 transitions
+
+    def test_locked_16_frame_8_plus_8_curriculum_smoke_survives_backward_and_reload(self, tmp_path):
+        """The locked US-011 candidate (16-frame clip, 8 burn-in + 8 supervised) must complete a
+        forward/backward, a state-dict save+reload, and a subsequent chronological (no-grad)
+        unroll with every state, output, loss, and gradient finite."""
+        module, _mc, criterion = self._module(
+            tmp_path, clip_length=16, burn_in_frames=8, supervised_frames=8, lifecycle_mode="inference_like"
+        )
+        criterion.side_effect = [{"loss_ce": (module.model.weight * 0.0 + 1.0).squeeze()} for _ in range(8)]
+        criterion.matcher = lambda outputs, targets: [
+            (torch.empty(0, dtype=torch.long), torch.empty(0, dtype=torch.long))
+        ]
+        frame_batches = tuple(_make_batch(batch_size=1)[0] for _ in range(16))
+        target_batches = tuple((self._target([7], [[0.5, 0.5, 0.2, 0.2]]),) for _ in range(16))
+        module._trainer = SimpleNamespace(accumulate_grad_batches=1, current_epoch=0, global_step=0)
+        type(module).trainer = property(lambda self: self._trainer)
+        try:
+            loss_dict, frame_outputs = module._unroll_tracking_clip(
+                frame_batches, target_batches, inference_like=True, burn_in_frames=8
+            )
+            assert len(frame_outputs) == 16  # burn-in frames still forward the model
+            loss = loss_dict["loss_ce"]
+            assert torch.isfinite(loss)
+            loss.backward()
+            assert module.model.weight.grad is not None
+            assert torch.isfinite(module.model.weight.grad).all()
+
+            checkpoint_path = tmp_path / "smoke.ckpt"
+            torch.save(module.state_dict(), checkpoint_path)
+            module.load_state_dict(torch.load(checkpoint_path, weights_only=True))
+
+            with torch.no_grad():
+                inference_losses, inference_outputs = module._unroll_tracking_clip(
+                    frame_batches, target_batches, inference_like=True, burn_in_frames=8, compute_losses=False
+                )
+            assert inference_losses == {}
+            for outputs, _targets in inference_outputs:
+                assert torch.isfinite(outputs["pred_boxes"]).all()
+                assert torch.isfinite(outputs["pred_logits"]).all()
+        finally:
+            del type(module).trainer
+
+
+class TestLifecycleCommitmentCurriculum:
+    """Duplicate-FP PRD US-009: a deterministic assignment-guided -> prediction-driven
+    commitment curriculum, per-step oracle/prediction and lifecycle-transition logging, and a
+    controlled proof that a false model birth persists into the next supervised frame and is
+    supervised as no-object rather than silently repaired by ground truth."""
+
+    class _CausalModel(nn.Module):
+        """Emits a strong foreground score only on ``birth_query`` for the first frame and
+        weak scores afterwards, carrying the prior active mask forward so a committed birth is
+        visible to the next frame's forward pass."""
+
+        def __init__(self, mc, *, birth_query: int) -> None:
+            super().__init__()
+            self.mc = mc
+            self.birth_query = birth_query
+            self.weight = nn.Parameter(torch.ones(1))
+            self.prior_states: list[TrackQueryState | None] = []
+
+        def forward_tracking(self, samples, prior_state=None):
+            self.prior_states.append(prior_state)
+            first_frame = len(self.prior_states) == 1
+            logits = torch.full((1, self.mc.num_queries, self.mc.num_classes + 1), -10.0)
+            if first_frame:
+                logits[0, self.birth_query, 0] = 10.0
+            index = torch.arange(self.mc.num_queries, dtype=torch.float32)
+            cx = 0.05 + 0.01 * (index % 40)
+            half = torch.full((self.mc.num_queries,), 0.5)
+            wh = torch.full((self.mc.num_queries,), 0.005)
+            boxes = torch.stack([cx, half, wh, wh], dim=-1).unsqueeze(0) * self.weight
+            active_mask = (
+                torch.zeros((1, self.mc.num_queries), dtype=torch.bool)
+                if prior_state is None
+                else prior_state.active_mask
+            )
+            features = (self.weight).expand(1, self.mc.num_queries, self.mc.hidden_dim)
+            return TrackingFrameOutput(
+                pred_logits=logits,
+                pred_boxes=boxes,
+                candidate_state=TrackQueryState(features, boxes, torch.ones_like(active_mask)),
+                input_active_mask=active_mask,
+            )
+
+    @staticmethod
+    def _empty_frame_targets(num_frames: int) -> tuple:
+        """Per-frame targets with no ground-truth objects at all."""
+        return tuple(
+            (
+                {
+                    "boxes": torch.zeros((0, 4)),
+                    "labels": torch.zeros((0,), dtype=torch.int64),
+                    "track_ids": torch.zeros((0,), dtype=torch.int64),
+                    "orig_size": torch.tensor([16, 16]),
+                },
+            )
+            for _ in range(num_frames)
+        )
+
+    def _module(self, tmp_path, *, clip_length: int = 2, birth_query: int = 0, **tracking_overrides):
+        mc = _base_model_config(tracking={"enabled": True}, group_detr=1)
+        lifecycle = TrackingSessionConfig(
+            activation_threshold=0.5,
+            continuation_threshold=0.3,
+            tentative_confirmation_hits=1,
+            tentative_confirmation_window_frames=1,
+            tentative_max_misses=1,
+            max_missed_frames=5,
+        )
+        overrides = dict(clip_length=clip_length, lifecycle=lifecycle)
+        overrides.update(tracking_overrides)
+        tc = _base_train_config(tmp_path, tracking=overrides)
+        module, _, criterion, _ = _build_module(model_config=mc, train_config=tc, tmp_path=tmp_path)
+        module.model = self._CausalModel(mc, birth_query=birth_query)
+        criterion.matcher = MagicMock()
+        criterion.weight_dict = {"loss_ce": 1.0}
+        return module, mc, criterion
+
+    def test_disabled_curriculum_defers_to_static_lifecycle_mode(self, tmp_path):
+        """``mode="disabled"`` keeps the static ``lifecycle_mode`` in force for the whole run,
+        so pre-existing assignment-guided and inference-like configs are unchanged."""
+        guided, *_ = self._module(tmp_path / "guided", lifecycle_mode="assignment_guided")
+        inference, *_ = self._module(tmp_path / "inference", lifecycle_mode="inference_like")
+        assert guided._resolve_supervised_lifecycle_inference_like() is False
+        assert inference._resolve_supervised_lifecycle_inference_like() is True
+
+    def test_epoch_curriculum_switches_after_warmup_epochs(self, tmp_path):
+        """Deterministic epoch schedule: assignment-guided while ``current_epoch <
+        warmup_epochs``, prediction-driven at and after it."""
+        module, *_ = self._module(
+            tmp_path,
+            lifecycle_mode="assignment_guided",
+            lifecycle_commitment_curriculum={"mode": "epoch", "warmup_epochs": 3},
+        )
+        module._trainer = SimpleNamespace(current_epoch=2, global_step=999)
+        assert module._resolve_supervised_lifecycle_inference_like() is False
+        module._trainer = SimpleNamespace(current_epoch=3, global_step=0)
+        assert module._resolve_supervised_lifecycle_inference_like() is True
+
+    def test_step_curriculum_switches_after_warmup_steps(self, tmp_path):
+        """Deterministic global-step schedule, independent of ``lifecycle_mode``."""
+        module, *_ = self._module(
+            tmp_path,
+            lifecycle_mode="assignment_guided",
+            lifecycle_commitment_curriculum={"mode": "step", "warmup_steps": 10},
+        )
+        module._trainer = SimpleNamespace(current_epoch=99, global_step=9)
+        assert module._resolve_supervised_lifecycle_inference_like() is False
+        module._trainer = SimpleNamespace(current_epoch=0, global_step=10)
+        assert module._resolve_supervised_lifecycle_inference_like() is True
+
+    def _run_training_step(self, module, criterion, *, num_frames: int):
+        frame_batches = tuple(_make_batch(batch_size=1)[0] for _ in range(num_frames))
+        target_batches = self._empty_frame_targets(num_frames)
+        criterion.side_effect = [{"loss_ce": torch.tensor(1.0, requires_grad=True)} for _ in range(num_frames)]
+        module.log = MagicMock()
+        module.log_dict = MagicMock()
+        module._trainer = SimpleNamespace(accumulate_grad_batches=1)
+        type(module).trainer = property(lambda self: self._trainer)
+        try:
+            module.training_step((frame_batches, target_batches), batch_idx=0)
+        finally:
+            del type(module).trainer
+        return {call.args[0]: call.args[1] for call in module.log.call_args_list if call.args}
+
+    def test_training_step_logs_prediction_commitment_fraction_and_every_transition_kind(self, tmp_path):
+        """An ``inference_like`` step logs a prediction-driven fraction of 1.0 and one gauge per
+        lifecycle event kind, so oracle/prediction commitment and every transition type are
+        observable during training."""
+        module, _mc, criterion = self._module(tmp_path, clip_length=2, lifecycle_mode="inference_like")
+        logged = self._run_training_step(module, criterion, num_frames=2)
+
+        assert logged["train/lifecycle_prediction_driven_fraction"] == pytest.approx(1.0)
+        assert logged["train/lifecycle_oracle_fraction"] == pytest.approx(0.0)
+        for kind in (
+            "tentative_started",
+            "confirmed",
+            "tentative_cancelled",
+            "activated",
+            "suspended",
+            "recovered",
+            "reassociated",
+            "terminated",
+            "duplicate_suppressed",
+            "capacity_suppressed",
+        ):
+            assert f"train/lifecycle_event_{kind}" in logged
+        # The synthetic false birth on frame 0 and its collapse on frame 1 must show up as
+        # real, nonzero prediction-driven transitions.
+        assert logged["train/lifecycle_event_activated"] >= 1.0
+        assert logged["train/lifecycle_event_suspended"] >= 1.0
+
+    def test_assignment_guided_step_logs_zero_prediction_driven_fraction(self, tmp_path):
+        """The assignment-guided control commits no deployment-lifecycle transitions, so its
+        prediction-driven fraction is 0.0 and every event gauge stays at zero -- keeping the
+        matched ablation's logs distinguishable."""
+        module, _mc, criterion = self._module(tmp_path, clip_length=2, lifecycle_mode="assignment_guided")
+        logged = self._run_training_step(module, criterion, num_frames=2)
+
+        assert logged["train/lifecycle_prediction_driven_fraction"] == pytest.approx(0.0)
+        assert logged["train/lifecycle_oracle_fraction"] == pytest.approx(1.0)
+        assert logged["train/lifecycle_event_activated"] == pytest.approx(0.0)
+
+    def test_false_birth_persists_into_next_frame_and_receives_no_object_supervision(self, tmp_path):
+        """Controlled proof: a model-only false birth on frame 0 (no ground truth anywhere)
+        is carried into frame 1's recurrent state and, because its identity matches no target,
+        frame 1's identity-aware assignment leaves it unmatched -- so the criterion supervises
+        it as no-object instead of ground truth silently repairing the recurrent state."""
+        module, mc, criterion = self._module(tmp_path, clip_length=2, lifecycle_mode="inference_like")
+        captured: list = []
+        criterion.side_effect = lambda outputs, targets, assignments: (
+            captured.append(assignments) or {"loss_ce": torch.tensor(1.0, requires_grad=True)}
+        )
+
+        frame_batches = tuple(_make_batch(batch_size=1)[0] for _ in range(2))
+        module._unroll_tracking_clip(frame_batches, self._empty_frame_targets(2), inference_like=True)
+
+        # The birth is the model's own decision: frame 1's forward pass sees slot 0 still active.
+        second_prior = module.model.prior_states[1]
+        assert second_prior is not None
+        assert bool(second_prior.active_mask[0, 0]) is True
+
+        frame1_assignment = captured[1][0]
+        assert frame1_assignment.slot_track_ids[0] is not None  # identity persisted, not repaired
+        assert 0 in frame1_assignment.absent_query_indices.tolist()
+        assert 0 not in frame1_assignment.decoder_indices[0].tolist()  # supervised as no-object
+        # And the persisted identity was never sourced from a (nonexistent) ground-truth target.
+        assert module._lifecycle_transition_counts["activated"] >= 1
 
 
 class TestValidationStep:

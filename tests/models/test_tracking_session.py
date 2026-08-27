@@ -71,18 +71,16 @@ class TestTrackingSession:
     def test_shared_model_sessions_keep_independent_state_and_reset_ids(self) -> None:
         """Sessions do not store state on their shared model and reset restarts IDs."""
         owner = _owner()
-        first = owner.create_tracking_session()
-        second = owner.create_tracking_session()
+        immediate_config = TrackingSessionConfig(tentative_confirmation_hits=1)
+        first = owner.create_tracking_session(immediate_config)
+        second = owner.create_tracking_session(immediate_config)
         frame = np.zeros((6, 10, 3), dtype=np.uint8)
 
-        assert first.update(frame).tracker_id.tolist() == []
         assert first.update(frame).tracker_id.tolist() == [0]
-        assert second.update(frame).tracker_id.tolist() == []
         assert second.update(frame).tracker_id.tolist() == [0]
         assert first.update(frame).tracker_id.tolist() == [0]
 
         first.reset()
-        assert first.update(frame).tracker_id.tolist() == []
         assert first.update(frame).tracker_id.tolist() == [0]
         assert second.active_tracks[0].track_id == 0
 
@@ -96,35 +94,40 @@ class TestTrackingSession:
     )
     def test_update_accepts_single_predict_input_types_and_aligns_ids(self, frame: object) -> None:
         """Retained detections expose slot-aligned IDs and pixel boxes."""
-        session = TrackingSession(_owner(), TrackingSessionConfig())
+        session = TrackingSession(_owner(), TrackingSessionConfig(tentative_confirmation_hits=1))
 
         first = session.update(frame, frame_index=4, timestamp=1.4)
         detections = session.update(frame, frame_index=5, timestamp=1.5)
 
-        assert first.tracker_id.tolist() == []
+        assert first.tracker_id.tolist() == [0]
         assert detections.tracker_id.tolist() == [0]
         assert detections.class_id.tolist() == [0]
         assert detections.xyxy.tolist() == [[2.5, 1.5, 7.5, 4.5]]
         assert detections.metadata["frame_index"] == 5
         assert detections.metadata["timestamp"] == 1.5
 
-    def test_reset_cancels_tentative_birth_and_restarts_confirmation(self) -> None:
-        """Sequence reset discards private birth state as well as public identities."""
+    def test_reset_discards_the_private_tentative_pool_as_well_as_public_identities(self) -> None:
+        """Sequence reset discards host-only tentative candidates, not just table/state."""
         session = TrackingSession(_owner())
         frame = torch.zeros(3, 6, 10)
 
         assert session.update(frame).tracker_id.tolist() == []
+        assert len(session.tentative_pool.records) == 1
         session.reset()
+
+        assert session.tentative_pool.records == ()
+        assert session.tentative_pool.next_tentative_id == 0
         assert session.update(frame).tracker_id.tolist() == []
-        assert session.update(frame).tracker_id.tolist() == [0]
+        assert len(session.tentative_pool.records) == 1
 
     def test_production_shaped_background_query_is_not_emitted(self) -> None:
         """A two-logit no-object winner remains absent from public detections."""
-        session = TrackingSession(_owner())
+        config = TrackingSessionConfig(tentative_confirmation_hits=1)
+        session = TrackingSession(_owner(), config)
         first = session.update(torch.zeros(3, 6, 10))
         detections = session.update(torch.zeros(3, 6, 10))
 
-        assert first.tracker_id.tolist() == []
+        assert first.tracker_id.tolist() == [0]
         assert detections.tracker_id.tolist() == [0]
         assert detections.class_id.tolist() == [0]
         assert session.last_frame_output is not None
@@ -132,7 +135,8 @@ class TestTrackingSession:
 
     def test_public_detections_use_external_foreground_category_ids(self) -> None:
         """Session output maps the selected foreground logit through the authoritative schema."""
-        session = TrackingSession(_owner(external_category_id=7))
+        config = TrackingSessionConfig(tentative_confirmation_hits=1)
+        session = TrackingSession(_owner(external_category_id=7), config)
         session.update(torch.zeros(3, 6, 10))
         detections = session.update(torch.zeros(3, 6, 10))
 
@@ -141,7 +145,7 @@ class TestTrackingSession:
     def test_stateless_prediction_between_updates_does_not_change_identity(self) -> None:
         """Ordinary image prediction remains independent from session state."""
         owner = _owner()
-        session = owner.create_tracking_session()
+        session = owner.create_tracking_session(TrackingSessionConfig(tentative_confirmation_hits=1))
         frame = torch.zeros(3, 6, 10)
         session.update(frame)
         first = session.update(frame)

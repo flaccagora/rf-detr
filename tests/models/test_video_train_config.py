@@ -9,7 +9,13 @@ from pathlib import Path
 
 import pytest
 
-from rfdetr.config import RFDETRBaseConfig, TrackingConfig, TrackingTrainConfig, TrainConfig
+from rfdetr.config import (
+    ErrorExposureCurriculumConfig,
+    RFDETRBaseConfig,
+    TrackingConfig,
+    TrackingTrainConfig,
+    TrainConfig,
+)
 
 
 def _model_config(**overrides: object) -> RFDETRBaseConfig:
@@ -65,6 +71,11 @@ def test_video_dataset_configuration_round_trips_without_changing_image_defaults
         "supervised_frames": 4,
         "tbptt_chunk_frames": None,
         "lifecycle_mode": "assignment_guided",
+        "lifecycle_commitment_curriculum": {
+            "mode": "disabled",
+            "warmup_epochs": 0,
+            "warmup_steps": 0,
+        },
         "lifecycle": {
             "activation_threshold": 0.5,
             "continuation_threshold": 0.3,
@@ -73,8 +84,12 @@ def test_video_dataset_configuration_round_trips_without_changing_image_defaults
             "tentative_confirmation_hits": 2,
             "tentative_confirmation_window_frames": 3,
             "tentative_max_misses": 2,
+            "tentative_association_iou_threshold": 0.3,
             "max_discovery_candidates_per_frame": 10,
             "max_tentative_tracks": 10,
+            "collision_iou_threshold": 0.7,
+            "collision_persistence_frames": 3,
+            "collision_loser_outcome": "suspended",
             "reassociation_enabled": False,
             "reassociation_iou_threshold": 0.5,
             "motion_reference_prediction_enabled": False,
@@ -90,6 +105,13 @@ def test_video_dataset_configuration_round_trips_without_changing_image_defaults
         "query_dropout_enabled": False,
         "query_dropout_probability": 0.10,
         "error_exposure_seed": 0,
+        "error_exposure_curriculum": {
+            "mode": "disabled",
+            "warmup_epochs": 0,
+            "ramp_epochs": 0,
+            "warmup_steps": 0,
+            "ramp_steps": 0,
+        },
     }
 
 
@@ -137,6 +159,40 @@ def test_false_positive_injection_max_per_sample_rejects_negative() -> None:
     """A negative per-sample injection cap has no meaning."""
     with pytest.raises(ValueError):
         TrackingTrainConfig(false_positive_injection_max_per_sample=-1)
+
+
+def test_error_exposure_curriculum_defaults_to_disabled() -> None:
+    """Duplicate-FP PRD US-010: the sampling-rate curriculum is off by default, so the
+    configured injection/dropout probabilities apply unchanged for the whole run."""
+    curriculum = TrackingTrainConfig().error_exposure_curriculum
+    assert curriculum.mode == "disabled"
+    assert curriculum.factor_at(epoch=0, step=0) == 1.0
+    assert curriculum.factor_at(epoch=99, step=9999) == 1.0
+
+
+def test_error_exposure_curriculum_epoch_warmup_then_linear_ramp() -> None:
+    """US-010: an epoch schedule holds the factor at 0 through the warm-up, then ramps it
+    linearly to 1 over the ramp window and sustains 1 afterwards."""
+    curriculum = ErrorExposureCurriculumConfig(mode="epoch", warmup_epochs=2, ramp_epochs=4)
+    assert curriculum.factor_at(epoch=1, step=0) == 0.0
+    assert curriculum.factor_at(epoch=2, step=0) == 0.0
+    assert curriculum.factor_at(epoch=4, step=0) == pytest.approx(0.5)
+    assert curriculum.factor_at(epoch=6, step=0) == 1.0
+    assert curriculum.factor_at(epoch=100, step=0) == 1.0
+
+
+def test_error_exposure_curriculum_step_schedule_without_ramp_is_a_step_function() -> None:
+    """US-010: a zero ramp window switches straight from 0 to 1 once the step warm-up elapses."""
+    curriculum = ErrorExposureCurriculumConfig(mode="step", warmup_steps=10, ramp_steps=0)
+    assert curriculum.factor_at(epoch=0, step=9) == 0.0
+    assert curriculum.factor_at(epoch=0, step=10) == 1.0
+
+
+@pytest.mark.parametrize("field", ["warmup_epochs", "ramp_epochs", "warmup_steps", "ramp_steps"])
+def test_error_exposure_curriculum_rejects_negative_windows(field: str) -> None:
+    """Negative warm-up or ramp windows have no schedule meaning."""
+    with pytest.raises(ValueError):
+        ErrorExposureCurriculumConfig(**{field: -1})
 
 
 def test_burn_in_and_tbptt_default_to_no_curriculum() -> None:
